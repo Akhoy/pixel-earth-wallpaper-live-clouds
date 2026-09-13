@@ -1,0 +1,40 @@
+name: Build and publish cloud mask
+
+on:
+  schedule:
+    # Once daily, ~04:00 UTC. VIIRS mosaics only update once per UTC day
+    # anyway (see pipeline/run_pipeline.py), and this gives the last orbits
+    # of the prior UTC day (~3.5h publishing delay) time to land before the
+    # pipeline's own coverage check runs.
+    - cron: "0 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        run: |
+          python pipeline/run_pipeline.py \
+            --width 4096 \
+            --out output/latest \
+            --base-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+
+      - name: Publish to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: output/latest
+          keep_files: false

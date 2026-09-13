@@ -1,0 +1,11 @@
+# Required by pipeline/run_pipeline.py (the scheduled cloud-mask job).
+numpy
+pillow
+requests
+
+# Only needed for the storms pipeline (pipeline/run_storms.py) and for local
+# debugging tools (clearsky.py, preview_globe.py) -- not installed by the
+# scheduled GitHub Actions workflow, which runs run_pipeline.py only.
+# scipy
+# h5py
+# texture2ddecoder
