@@ -6,7 +6,11 @@ on:
     # anyway (see pipeline/run_pipeline.py), and this gives the last orbits
     # of the prior UTC day (~3.5h publishing delay) time to land before the
     # pipeline's own coverage check runs.
-    - cron: "0 4 * * *"
+    #
+    # Offset 17 minutes past the hour, not exactly on it -- GitHub's own
+    # docs note that schedules landing exactly on the hour are more likely
+    # to be delayed, since that's when every other repo's cron also fires.
+    - cron: "17 4 * * *"
   workflow_dispatch: {}
 
 permissions:
