@@ -2,17 +2,21 @@ name: Build and publish cloud mask
 
 on:
   schedule:
-    # Once daily, ~01:00 UTC. GitHub's own scheduler does not fire `cron`
-    # triggers at the exact requested minute -- confirmed 2026-09-14: a job
-    # scheduled for 04:00 UTC actually ran at 09:35 UTC, a ~5.5h delay, with
-    # no fixed/predictable offset. Since the delay itself is unpredictable
-    # either way, there's no minute-level scheduling to protect here; this
-    # just needs to be early enough in the UTC day that even a multi-hour
-    # GitHub-side delay still lands before the pipeline is next needed.
-    # (The pipeline's own coverage-based fallback in run_pipeline.py already
-    # separately handles the case where the requested day's satellite data
-    # itself isn't fully published yet, regardless of when this fires.)
+    # Three attempts per UTC day, not because the underlying VIIRS data
+    # changes more than once a day (it doesn't -- see run_pipeline.py), but
+    # because GitHub's own scheduler does not fire `cron` triggers reliably
+    # close to the requested minute -- confirmed 2026-09-14: a job scheduled
+    # for 04:00 UTC actually ran at 09:35 UTC, a ~5.5h delay, with no fixed/
+    # predictable offset. Multiple independent daily windows hedge against
+    # any single one slipping or silently not firing; whichever fires first
+    # each day publishes that day's data, and the later ones are then cheap
+    # no-op-ish re-runs of the same day's already-current mask (harmless,
+    # just a redundant publish). The pipeline's own coverage-based fallback
+    # in run_pipeline.py separately handles the case where a day's satellite
+    # data itself isn't fully published yet, regardless of when this fires.
+    - cron: "0 0 * * *"
     - cron: "0 1 * * *"
+    - cron: "0 4 * * *"
   workflow_dispatch: {}
 
 permissions:
