@@ -14,9 +14,12 @@ on:
     # just a redundant publish). The pipeline's own coverage-based fallback
     # in run_pipeline.py separately handles the case where a day's satellite
     # data itself isn't fully published yet, regardless of when this fires.
-    - cron: "0 0 * * *"
-    - cron: "0 1 * * *"
-    - cron: "0 4 * * *"
+    # (12 minutes past, not on the hour itself -- GitHub's own docs note
+    # exact-hour schedules are more likely to be delayed, since that's when
+    # every other repo's cron also fires at once.)
+    - cron: "12 0 * * *"
+    - cron: "12 1 * * *"
+    - cron: "12 4 * * *"
   workflow_dispatch: {}
 
 permissions:
