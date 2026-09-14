@@ -7,12 +7,12 @@ on:
     # of the prior UTC day (~3.5h publishing delay) time to land before the
     # pipeline's own coverage check runs.
     #
-    # TEMPORARY one-off test trigger (2026-09-14 10:03 UTC) to check whether
+    # TEMPORARY one-off test trigger (2026-09-14 10:10 UTC) to check whether
     # GitHub's scheduler actually fires a `schedule` event for this
-    # workflow at all, after yesterday's real 04:00 UTC window silently
-    # didn't. Revert to the daily 04:17 UTC schedule once confirmed either
-    # way.
-    - cron: "3 10 14 9 *"
+    # workflow at all, after two prior windows silently didn't (or were
+    # confused with a manual run). Revert to the daily 04:17 UTC schedule
+    # once confirmed either way.
+    - cron: "10 10 14 9 *"
   workflow_dispatch: {}
 
 permissions:
