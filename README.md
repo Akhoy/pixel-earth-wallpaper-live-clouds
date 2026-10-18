@@ -7,10 +7,11 @@ wallpaper) expects. The app's own two live-data endpoints (cloud tiles and
 lightning-storm locations) both stopped updating years ago; this project
 replaces the cloud-tile side with real, current data.
 
-**This repo is the pipeline only.** It has no dependency on, and does not
-contain, any of Google's app code or assets — the app side (pointing its
-`CloudsProvider` at the URL this pipeline publishes to) is a separate,
-local patch not published here.
+**This repo contains the pipeline only — no Google code or assets are in the
+source tree.** The app side is a patched build of Google's original wallpaper
+APK (its `CloudsProvider` repointed at the URL this pipeline publishes to). That
+patched APK is **not** part of the source; it is attached as a binary on the
+[Releases page](../../releases) — see [Download the patched app](#download-the-patched-app).
 
 ## How it works
 
@@ -55,6 +56,31 @@ GitHub Pages then serves the published output directly from the repo's
 ```
 https://akhoy.github.io/pixel-earth-wallpaper-live-clouds/root.json
 ```
+
+## Download the patched app
+
+A ready-to-install, working APK is attached to the latest
+[release](../../releases/latest). It is Google's original "Marvelous Marble"
+Earth wallpaper (`com.breel.wallpapers18`) with two small patches:
+
+- `CloudsProvider` fetches its cloud tiles from this project's GitHub Pages
+  URL (above) instead of Google's dead endpoint.
+- `usesCleartextTraffic` is enabled in the manifest (only needed for local
+  dev-server testing).
+
+Everything else — shaders, textures, day/night maps — is Google's stock app,
+unmodified. The lightning-storm feed is **not** replaced yet (see
+[Status](#status--known-limitations)).
+
+**Install:** download the `.apk` from the release, open it on your Android
+device and allow "install unknown apps" when prompted, then choose the
+wallpaper from your launcher's wallpaper picker. The APK is signed with a
+debug key, so it will not update an official Google build in place — uninstall
+that copy first if one is installed.
+
+**Note:** this is an unofficial, unaffiliated modification of Google's app,
+shared for preservation and personal use. All rights to the original app and
+its assets remain with Google.
 
 ## Repo layout
 
