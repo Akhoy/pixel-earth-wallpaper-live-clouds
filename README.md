@@ -61,10 +61,12 @@ https://akhoy.github.io/pixel-earth-wallpaper-live-clouds/root.json
 
 A ready-to-install, working APK is attached to the latest
 [release](../../releases/latest). It is Google's original "Marvelous Marble"
-Earth wallpaper (`com.breel.wallpapers18`) with one small patch:
+Earth wallpaper (`com.breel.wallpapers18`) with two small patches:
 
 - `CloudsProvider` fetches its cloud tiles from this project's GitHub Pages
   URL (above) instead of Google's dead endpoint.
+- `targetSdkVersion` is raised from 31 to 35 so current Android versions
+  (tested on Android 17) don't flag it as built for an older version.
 
 Everything else — shaders, textures, day/night maps — is Google's stock app,
 unmodified (the storms feed keeps Google's original, now-dead URL). The lightning-storm feed is **not** replaced yet (see
@@ -72,7 +74,8 @@ unmodified (the storms feed keeps Google's original, now-dead URL). The lightnin
 
 **Install:** download the `.apk` from the release, open it on your Android
 device and allow "install unknown apps" when prompted, then choose the
-wallpaper from your launcher's wallpaper picker. The APK is signed with a
+wallpaper from Wallpaper & style → live wallpapers. The app has no launcher
+icon (same as Google's original); it only appears in the wallpaper picker. The APK is signed with a
 debug key, so it will not update an official Google build in place — uninstall
 that copy first if one is installed.
 
