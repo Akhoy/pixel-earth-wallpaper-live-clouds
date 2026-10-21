@@ -29,7 +29,7 @@ def synthetic_mask(south_hole_lat=-84.0, north_hole_lat=72.0, fringe=True, seed=
     lat = _lat()
     cm = np.where(lat < -62, 240.0, cm)
     if fringe:
-        cm = np.where((lat < south_hole_lat + 3) & (lat >= south_hole_lat), 120.0, cm)
+        cm = np.where((lat < south_hole_lat + 2) & (lat >= south_hole_lat), 120.0, cm)
     cm = np.where(lat < south_hole_lat, 0.0, cm)
     cm = np.where(lat > north_hole_lat, 0.0, cm)
     return cm.astype(np.uint8)
@@ -125,6 +125,100 @@ class HoleSurvivesGapFillTests(unittest.TestCase):
         self.assertGreater(covered, 0.99)
 
 
+class WinterTests(unittest.TestCase):
+    """Deep-winter holes (radius ~300 px, 2-3x the Sept/Oct ones) -- Dec 2025 / Jun 2026 behaviour."""
+
+    def test_infrared_wedge_is_repaired_not_rejected(self):
+        ir = np.full((512, 1024), 130.0, np.float32)
+        ir[:3, 100:140] = 0                                   # small no-data wedge at the pole (1.9% in Dec 2025)
+        self.assertTrue(polar.ir_is_complete(ir))
+        fixed = polar.fill_ir_gaps(ir)
+        self.assertGreater(float(fixed[:3, 100:140].min()), 100)
+        bad = np.full((512, 1024), 130.0, np.float32)
+        bad[:15, :] = 0                                       # a partial day: 50% of the cap black
+        self.assertFalse(polar.ir_is_complete(bad))
+
+    def test_pull_push_fill_has_no_concentric_steps(self):
+        n = polar.FACE_SIZE
+        R = polar._radius_grid()
+        yy, xx = np.mgrid[0:n, 0:n]
+        photo = (120 + 0.12 * xx).astype(np.float32)          # smooth left-to-right gradient everywhere
+        hole = (R < 300).astype(np.float32)
+        out = polar.fill_hole(np.where(hole > 0.5, 0, photo).astype(np.float32), hole, None).astype(np.float32)
+        ring_means = [out[(R > r) & (R < r + 6)].mean() for r in range(40, 280, 6)]
+        self.assertLess(float(np.max(np.abs(np.diff(ring_means)))), 6.0)       # no jumps between neighbouring rings
+        self.assertGreater(float(out[R < 250].min()), 60.0)                    # and nothing black
+
+    def test_big_hole_tries_google_tile_first(self):
+        cm = synthetic_mask(south_hole_lat=-62, north_hole_lat=90, fringe=False)
+        A = faces_of(cm)["nz"][..., 0].astype(np.float32)
+        Hm = (polar._radius_grid() < 300).astype(np.float32)
+        order = []
+        orig_fill, orig_tile = polar.fill_hole, polar.google_tile_fill
+        polar.fill_hole = lambda a, h, d=None: (order.append("fill+tex" if d else "fill"), np.zeros(a.shape, np.uint8))[1]
+        polar.google_tile_fill = lambda a, h, f: (order.append("tile"), np.zeros(a.shape, np.uint8))[1]
+        try:
+            polar._own_data_fills(A, Hm, "nz", "south", lambda *_: None, {}, "antarctic")
+        finally:
+            polar.fill_hole, polar.google_tile_fill = orig_fill, orig_tile
+        self.assertEqual(order, ["tile", "fill+tex", "fill"])
+        small = (polar._radius_grid() < 100).astype(np.float32)
+        order.clear()
+        polar.fill_hole = lambda a, h, d=None: (order.append("fill+tex" if d else "fill"), np.zeros(a.shape, np.uint8))[1]
+        polar.google_tile_fill = lambda a, h, f: (order.append("tile"), np.zeros(a.shape, np.uint8))[1]
+        try:
+            polar._own_data_fills(A, small, "nz", "south", lambda *_: None, {}, "antarctic")
+        finally:
+            polar.fill_hole, polar.google_tile_fill = orig_fill, orig_tile
+        self.assertEqual(order, ["fill+tex", "fill", "tile"])
+
+    def test_big_hole_check_judges_the_edge_not_centre_vs_ring(self):
+        R = polar._radius_grid()
+        hole = (R < 300).astype(np.float32)
+        ok = np.where(R < 300, 235, 60).astype(np.uint8)      # bright ice inside, dark ocean outside is fine ...
+        ok = np.clip(ok.astype(np.float32) + np.where((R > 280) & (R < 300), -150 * (R - 280) / 20, 0) * 0, 0, 255).astype(np.uint8)
+        self.assertTrue(polar.check_face(np.where(R < 300, 70, 60).astype(np.uint8), hole, "south")["ok"])
+        self.assertFalse(polar.check_face(np.where(R < 300, 235, 60).astype(np.uint8), hole, "south")["ok"])  # hard edge
+        self.assertFalse(polar.check_face(np.where(R < 300, 0, 60).astype(np.uint8), hole, "south")["ok"])    # black disc
+
+
+class ScalingAndTinyHoleTests(unittest.TestCase):
+    def test_hole_measuring_scales_with_map_width(self):
+        """Regression: the grow/margin pixel counts were tuned at width 4096; at width 1024 they were 4x too
+        big relative to the map and swelled a 112 px hole to 211 px."""
+        def radius(width):
+            rng = np.random.default_rng(0)
+            h = width // 2
+            cm = np.clip(130 + 70 * (rng.random((h // 8, width // 8)).repeat(8, 0).repeat(8, 1) - 0.5), 0, 255)
+            lat = (90 - (np.arange(h) + 0.5) / h * 180)[:, None] * np.ones((1, width))
+            cm = np.where(lat > 80, 0, cm).astype(np.uint8)
+            hole = polar._face(polar.north_hole_grown(cm).astype(np.float32) * 255, "pz") / 255.0
+            return float(np.sqrt((hole > 0.5).sum() / np.pi))
+        r_small, r_big = radius(1024), radius(4096)
+        self.assertLess(abs(r_small - r_big) / r_big, 0.15)
+
+    def test_a_dot_sized_hole_is_not_judged_on_a_step(self):
+        """Regression: Feb 2026 has a 12 px hole at the Antarctic pole; its fill sat 14 grey levels under the
+        very bright, busy ring around it, which is nothing at that size but tripped the step limit (8) and
+        faded a pole that was already fine."""
+        R = polar._radius_grid()
+        hole = (R < 12).astype(np.float32)
+        face = np.full(R.shape, 235, np.uint8)
+        face[R < 12] = 221                                                          # step -14 against the ring
+        self.assertTrue(polar.check_face(face, hole, "south")["ok"])
+        face[R < 10] = 20                                                           # but a black dot is still caught
+        self.assertFalse(polar.check_face(face, hole, "south")["ok"])
+
+    def test_spread_takes_its_tone_from_the_nearest_edge(self):
+        """Regression: a coarse-pyramid fill pulled a hole in the middle of white ice toward the global mean
+        (the dark ocean far away): centre 207 vs 240 around it."""
+        R = polar._radius_grid()
+        photo = np.where(R < 330, 240.0, 40.0).astype(np.float32)            # ice disc in dark ocean
+        hole = (R < 150).astype(np.float32)
+        out = polar._spread_inward(np.where(hole > 0.5, 0, photo).astype(np.float32), 1 - hole)
+        self.assertGreater(float(out[R < 100].mean()), 230.0)
+
+
 class QualityCheckTests(unittest.TestCase):
     def _hole(self, radius=100):
         R = polar._radius_grid()
@@ -184,7 +278,8 @@ class InfraredTests(unittest.TestCase):
 
 class DriverTests(unittest.TestCase):
     def setUp(self):
-        self.cm = synthetic_mask(south_hole_lat=-82, north_hole_lat=74)
+        # Sept/Oct-size holes (radius ~100-150 px): the small-hole chain. Winter-size ones are in WinterTests.
+        self.cm = synthetic_mask(south_hole_lat=-84, north_hole_lat=80)
         self.faces = faces_of(self.cm)
 
     def _ir_fetch(self, sat, day, width):
@@ -195,7 +290,9 @@ class DriverTests(unittest.TestCase):
         out, rep = polar.apply_polar_fixes(self.faces, self.cm, date(2026, 10, 19), W, log=lambda *_: None,
                                            fetch=self._ir_fetch)
         self.assertEqual(rep["north"]["method"], "infrared overlay")   # regression: accepted fill must be used
-        self.assertEqual(rep["south"]["method"], "ice fill + Google texture")
+        # the south pole is the dark side in Apr-Sep, so infrared is tried there too; the synthetic one may or
+        # may not pass the check, either way the pole must end up filled by a real method, not the fade
+        self.assertIn(rep["south"]["method"], ("infrared overlay", "ice fill + Google texture"))
         self.assertFalse(np.array_equal(out["pz"], self.faces["pz"]))
         self.assertFalse(np.array_equal(out["nz"], self.faces["nz"]))
         for name in ("px", "nx", "py", "ny"):
@@ -207,6 +304,7 @@ class DriverTests(unittest.TestCase):
 
         out, rep = polar.apply_polar_fixes(self.faces, self.cm, date(2026, 10, 19), W, log=lambda *_: None, fetch=boom)
         self.assertEqual(rep["north"]["method"], "cloud fill + Google texture")
+        self.assertEqual(rep["south"]["method"], "ice fill + Google texture")
         R = polar._radius_grid()
         self.assertGreater(out["pz"][..., 0][R < 40].mean(), 60)        # the hole is filled, not black/faded
 

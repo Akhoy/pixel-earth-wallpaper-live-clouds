@@ -92,7 +92,9 @@ plus texture from Google's stock tile (`pipeline/assets/`); Antarctica the secon
 result, falling back to safer fills (last resort: the hole fades to "no cloud"). `merge.soften_dateline`
 cross-fades the date-line seam. Each run writes `_debug_polar_report.json` saying which fill ran. The
 Arctic infrared fill is cosmetic (infrared reads cold ice as cloud). Tests: `python -m unittest discover -s tests`.
-Needs `scipy` (in requirements.txt).
+In deep winter the holes are 2-3x bigger and ringed by a dim terminator band; `polar.py` grows over that band,
+uses the infrared for whichever pole is on the dark side, and judges big holes by their edge. Needs `scipy`
+(in requirements.txt).
 
 ## Repo layout
 

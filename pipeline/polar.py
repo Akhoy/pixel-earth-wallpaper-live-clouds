@@ -31,24 +31,26 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from scipy.ndimage import (binary_closing, binary_dilation, gaussian_filter, gaussian_filter1d, grey_closing,
-                           label, map_coordinates, maximum_filter, shift as nd_shift)
+                           distance_transform_edt, label, map_coordinates, maximum_filter, shift as nd_shift, zoom)
 
 from cubemap import equirect_to_face
 from gibs import IR_LAYERS, fetch_global_infrared
 from merge import fade_to_hole, find_polar_hole, soften_dateline
 
 FACE_SIZE = 1024
+REF_WIDTH = 4096              # map width the pixel-sized constants below were tuned at
 ASSETS = Path(__file__).parent / "assets"
 
 # --- infrared completeness: a day still being processed has holes/wrong tone
 IR_MIN_MEAN = 100.0          # a complete day averages ~113; a partial one ~75
-IR_MAX_CAP_BLACK = 0.01      # share of black pixels in the top 10 degrees
+IR_MAX_CAP_BLACK = 0.05      # share of black pixels in the top 10 degrees (a partial day had 10%; a small
+                             # missing wedge at the pole -- 1.9% on 2025-12-21 -- is repaired, not rejected)
 IR_MAX_DAYS_BACK = 5
 IR_QA_RETRIES = 3            # older infrared days to try if the newest one's fill fails the check
 
 # --- Arctic overlay (settings chosen by eye across 11 days, Oct 2026)
 GAIN = 0.95                  # infrared scaled a little under the photo mask's level
-FADE_IN, FADE_OUT = 170, 300  # px from the pole: full infrared inside, photo only outside
+FADE_IN_OFFSET, FADE_WIDTH = -14, 130   # full infrared out to (hole radius - 14) px, photo only past +130 px more
 HAZE = 0.10
 CAP, PROTECT = 0.35, 0.85    # merge strength over real photo / hold-back over dark water
 DETAIL, DETAIL_SCALE = 0.45, 6
@@ -60,8 +62,12 @@ PATCH_MAX_SCORE = 22         # worse than this -> smooth ring continuation inste
 SOUTH_FRINGE = 215           # half-lit pixels darker than this, touching the hole, join it
 SOUTH_GROW_STEPS, SOUTH_MARGIN = 3, 8
 DONOR_WEIGHT, DONOR_SCALE = 1.0, 30
+SPREAD_DOWN = 4              # _spread_inward works at 1/4 resolution
 
-# --- quality check (centre of the fill vs a ring just outside it)
+# --- quality check (see check_face)
+MIN_STEP_RADIUS_PX = 30      # holes smaller than this (Feb 2026: 12 px) only get the dark-pixel test
+LARGE_HOLE_PX = 200          # winter-size holes (radius ~300 px) are judged by their edge, not centre-vs-ring
+QA_LARGE = {"max_step": 25.0, "min_dark": 25.0}     # provisional, calibrated on winter 2025/26 in the harness
 QA = {
     # measured over 23 days (Sept 15 - Oct 19 2026): south steps -2.2..+1.8, darkest 207+;
     # north steps +18..+31, darkest 75+. A broken fill (dark ring/disc) lands far outside both.
@@ -91,10 +97,31 @@ def ir_is_complete(ir: np.ndarray) -> bool:
     return float(ir.mean()) >= IR_MIN_MEAN and float((cap < 3).mean()) < IR_MAX_CAP_BLACK
 
 
-def fetch_polar_infrared(target_day, width: int, fetch=fetch_global_infrared, log=print):
+def fill_ir_gaps(ir: np.ndarray) -> np.ndarray:
+    """Repair small no-data wedges (black) in the polar cap of the infrared by spreading the valid pixels
+    around them, so a missing sliver of a satellite pass doesn't become a dark streak in the fill."""
+    h = ir.shape[0]
+    cap = np.zeros(ir.shape, bool)
+    cap[: int(h * 20 / 180)] = True                          # top 20 degrees only
+    bad = (ir < 3) & cap
+    if not bad.any():
+        return ir
+    valid = (~bad).astype(np.float32)
+    out, done = ir.astype(np.float32) * valid, valid.copy()
+    base = out.copy()
+    for s in (4, 8, 16, 32, 64):
+        den = _blur(valid, s)
+        take = (done < 0.5) & (den > 0.02)
+        base = np.where(take, _blur(ir * valid, s) / np.maximum(den, 1e-4), base)
+        done = np.maximum(done, take.astype(np.float32))
+    return np.where(bad, base, ir).astype(np.float32)
+
+
+def fetch_polar_infrared(target_day, width: int, fetch=fetch_global_infrared, log=print, south: bool = False):
     """Newest complete infrared day at or before target_day, as (array, day),
     or None. Averages the satellites that answer, which also smooths the seams
-    between their passes."""
+    between their passes. south=True returns the map flipped top-to-bottom, so the
+    south pole is on the top rows where the completeness/repair code looks."""
     for back in range(IR_MAX_DAYS_BACK + 1):
         day = target_day - timedelta(days=back)
         layers = []
@@ -106,8 +133,10 @@ def fetch_polar_infrared(target_day, width: int, fetch=fetch_global_infrared, lo
         if not layers:
             continue
         ir = np.mean(layers, axis=0)
+        if south:
+            ir = ir[::-1]
         if ir_is_complete(ir):
-            ir = soften_dateline(ir)                            # same date-line seam as the photo mosaic
+            ir = fill_ir_gaps(soften_dateline(ir))              # same date-line seam as the photo mosaic
             if back:
                 log(f"infrared for {target_day} incomplete -- using {day}")
             return ir, day
@@ -117,11 +146,28 @@ def fetch_polar_infrared(target_day, width: int, fetch=fetch_global_infrared, lo
 
 # ------------------------------------------------------------------ Arctic
 
+def grow_face_hole(hole_face: np.ndarray) -> np.ndarray:
+    """Grow a big winter hole outward over the dim terminator band.
+
+    Just beyond the no-photo disc the sun is almost on the horizon, so the photo there is very dark
+    (cloud-mask values ~30-100 where normal cloud is ~170) for a band ~0.115 of the hole radius wide
+    (35 px at the Dec/Jun solstice). Left in, it shows as a grey ring around the fill. Small Sept/Oct
+    holes (radius < ~150) are unchanged; the growth ramps in up to full size at radius 230."""
+    r = float(np.sqrt((hole_face > 0.5).sum() / np.pi))
+    margin = 0.115 * r * float(np.clip((r - 150) / 80, 0, 1))
+    if margin < 1:
+        return hole_face
+    d = distance_transform_edt(hole_face < 0.5)
+    return np.maximum(hole_face, (d <= margin).astype(np.float32))
+
+
 def north_hole(cloud_gray: np.ndarray) -> np.ndarray:
-    h = cloud_gray.shape[0]
+    h, w = cloud_gray.shape
+    sc = w / REF_WIDTH
     gap = (cloud_gray == 0).astype(np.float32)
     gap[int(30 / 180 * h):] = 0
-    return maximum_filter(find_polar_hole(gap), size=15)   # also cover the invalid fringe at the rim
+    # also cover the invalid fringe at the rim
+    return maximum_filter(find_polar_hole(gap, radius=max(2, round(20 * sc))), size=max(3, round(15 * sc)))
 
 
 def arctic_overlay(photo_face: np.ndarray, hole_face: np.ndarray, ir: np.ndarray, cloud_gray: np.ndarray,
@@ -131,6 +177,10 @@ def arctic_overlay(photo_face: np.ndarray, hole_face: np.ndarray, ir: np.ndarray
     R = _radius_grid()
     # infrared -> cloud-mask scale, matched on the daylit band 58-70N
     band = slice(int((90 - 70) / 180 * h), int((90 - 58) / 180 * h))
+    if float((cloud_gray[band] == 0).mean()) > 0.3:             # deep winter: the usual band has no photo
+        rows = np.nonzero((cloud_gray[: h // 2] == 0).mean(axis=1) > 0.9)[0]
+        edge = rows.max() + 1 if len(rows) else int(h * 20 / 180)    # row where the no-photo cap ends
+        band = slice(max(0, edge + int(2 / 180 * h)), min(h // 2, edge + int(13 / 180 * h)))   # 2-13 deg outside it
     q = np.linspace(0, 100, 101)
     fill = np.interp(ir, np.percentile(ir[band], q), np.percentile(cloud_gray[band], q)).astype(np.float32)
     B = _face(fill, "pz")
@@ -173,7 +223,10 @@ def arctic_overlay(photo_face: np.ndarray, hole_face: np.ndarray, ir: np.ndarray
     B = (B * (1 - wc) + patch * wc) * GAIN
 
     # lay the infrared over the photo: full inside FADE_IN px, photo only past FADE_OUT
-    t = np.clip((FADE_OUT - R) / (FADE_OUT - FADE_IN), 0, 1)
+    r_hole = float(np.sqrt((hole_face > 0.5).sum() / np.pi))
+    fade_in = max(r_hole + FADE_IN_OFFSET, 60.0)               # scales with the hole: Oct 2026 r~184 gives 170/300
+    fade_out = fade_in + FADE_WIDTH
+    t = np.clip((fade_out - R) / (fade_out - fade_in), 0, 1)
     w = t * t * (3 - 2 * t) * MERGE_STRENGTH
     w_full = w.copy()
     Ap = photo_face * (1 - hole_face) + B * hole_face           # inside the hole the "photo" is the infrared
@@ -192,24 +245,26 @@ def arctic_overlay(photo_face: np.ndarray, hole_face: np.ndarray, ir: np.ndarray
 def south_hole(cloud_gray: np.ndarray) -> np.ndarray:
     """Measured per day: the solid no-data blob around the south pole, grown a
     few steps into the dark half-lit fringe, plus a margin."""
-    h = cloud_gray.shape[0]
+    h, w = cloud_gray.shape
+    sc = w / REF_WIDTH                                           # the pixel sizes below are tuned at width 4096
+    step, margin, closing = max(1, round(8 * sc)), max(1, round(SOUTH_MARGIN * sc)), max(1, round(6 * sc))
     lat = 90 - (np.arange(h) + 0.5) / h * 180
     south = (lat < -60)[:, None]
     gap = ((cloud_gray == 0) & south).astype(np.float32)
-    labels, _ = label(_blur(gap, 12) > 0.5)
+    labels, _ = label(_blur(gap, 12 * sc) > 0.5)
     pole = labels[h - 1][labels[h - 1] > 0]
     if not len(pole):
         return np.zeros(cloud_gray.shape, bool)
     cur = labels == np.bincount(pole).argmax()
     # pad past the pole row so closing/dilation don't erode at the array border
-    pad = 16
+    pad = 2 * (step + margin + closing)
     cur = np.pad(cur, ((0, pad), (0, 0)), mode="edge")
     south = np.pad(south, ((0, pad), (0, 0)), mode="edge")
     gray = np.pad(cloud_gray, ((0, pad), (0, 0)), mode="edge")
     for _ in range(SOUTH_GROW_STEPS):
-        ring = binary_dilation(cur, iterations=8) & ~cur
+        ring = binary_dilation(cur, iterations=step) & ~cur
         cur = cur | (ring & south & (gray < SOUTH_FRINGE))
-    return binary_dilation(binary_closing(cur, iterations=6), iterations=SOUTH_MARGIN)[:-pad]
+    return binary_dilation(binary_closing(cur, iterations=closing), iterations=margin)[:-pad]
 
 
 def north_hole_grown(cloud_gray: np.ndarray) -> np.ndarray:
@@ -222,17 +277,39 @@ def _donor(face_name: str):
     return np.array(Image.open(path).convert("L")).astype(np.float32) if path.exists() else None
 
 
+def _spread_inward(img: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Fill the invalid region from the valid pixels around it, nearest data first.
+
+    Each pixel takes a Gaussian-weighted average of the valid pixels around it, with a blur radius that grows
+    smoothly with its distance from the nearest valid pixel (radius = 0.5 x distance). So it takes its tone from
+    the closest edge (a hole in the middle of ice stays ice) instead of drifting to the global mean, and since
+    the radius varies continuously there are no concentric steps like a few fixed blur scales leave.
+    Works on a 4x smaller copy (the estimate is smooth anyway), then scales back up."""
+    f = SPREAD_DOWN
+    n = img.shape[0] // f
+    vw = valid.reshape(n, f, n, f).mean(axis=(1, 3))
+    num = (img * valid).reshape(n, f, n, f).mean(axis=(1, 3))
+    dist = distance_transform_edt(vw < 0.5)                      # in downsampled pixels
+    ladder = [1.0 * 1.4 ** k for k in range(0, 17)]               # sigma 1 .. ~290 downsampled px (4 .. ~1160 px)
+    est = np.stack([_blur(num, s) / np.maximum(_blur(vw, s), 1e-4) for s in ladder])
+    target = np.clip(0.5 * dist, ladder[0], ladder[-1])
+    pos = np.log(target / ladder[0]) / np.log(1.4)
+    lo = np.clip(np.floor(pos).astype(int), 0, len(ladder) - 2)
+    t = pos - lo
+    yy, xx = np.mgrid[0:n, 0:n]
+    out = est[lo, yy, xx] * (1 - t) + est[lo + 1, yy, xx] * t
+    out = np.where(vw >= 0.5, num / np.maximum(vw, 1e-4), out)
+    return zoom(out, f, order=1, mode="nearest")
+
+
 def fill_hole(photo_face: np.ndarray, hole_face: np.ndarray, donor_face: str | None = None) -> np.ndarray:
     """Spread the surrounding clouds/ice into the hole; optionally add texture
     from Google's stock tile for that pole (donor_face = 'pz' or 'nz')."""
     A, Hm = photo_face, hole_face
     valid = (Hm < 0.5).astype(np.float32)
-    base, done = A * valid, valid.copy()
-    for s in (8, 16, 32, 64, 128, 256, 512):                     # spread the surrounding ice inward
-        den = _blur(valid, s)
-        take = (done < 0.5) & (den > 0.01)
-        base = np.where(take, _blur(A * valid, s) / np.maximum(den, 1e-4), base)
-        done = np.maximum(done, take.astype(np.float32))
+    base = _spread_inward(A, valid)
+    inside = np.clip(_blur(Hm, 6) * 2, 0, 1)
+    base = base * (1 - inside) + _blur(base, 10) * inside        # smooth away any pyramid blockiness in the hole
     donor = _donor(donor_face) if donor_face else None
     ring = (Hm < 0.5) & (_blur(Hm, 40) > 0.02)
     if donor is not None and ring.any():
@@ -257,27 +334,41 @@ def google_tile_fill(photo_face: np.ndarray, hole_face: np.ndarray, donor_face: 
         return None
     gm, gs = donor[ring].mean(), donor[ring].std() + 1e-3
     tile = (donor - gm) / gs * min(photo_face[ring].std(), gs) + photo_face[ring].mean()   # never stretch contrast
-    w = np.clip(2 * _blur(hole_face, 30), 0, 1)
+    r = float(np.sqrt((hole_face > 0.5).sum() / np.pi))
+    w = np.clip(2 * _blur(hole_face, max(30.0, 0.12 * r)), 0, 1)     # wider soft edge on a big hole
     return np.clip(photo_face * (1 - w) + tile * w, 0, 255).astype(np.uint8)
 
 
 # --------------------------------------------------------------- quality check
 
 def check_face(face: np.ndarray, hole_face: np.ndarray, kind: str) -> dict:
-    """Brightness step between the filled centre and a ring just outside its edge, plus the darkest pixels."""
+    """Quality check of a filled pole.
+
+    Small hole (Sept/Oct, radius < LARGE_HOLE_PX): brightness step between the filled centre and a ring just
+    outside its edge, plus the darkest pixels -- a ring or dark disc lands far outside the limits.
+    Big winter hole: it spans ocean and cloud as well as ice, so centre-vs-ring means little; instead check
+    that there is no visible edge (mean just inside vs just outside the boundary) and no black disc."""
     area = float((hole_face > 0.5).sum())
     radius = float(np.sqrt(area / np.pi))
     if radius < 5:
         return {"ok": True, "radius": radius, "step": 0.0, "dark": 255.0, "reason": "no hole"}
     R = _radius_grid()
     f = face.astype(np.float32)
-    # ring just outside the edge (not scaled with the radius: on big holes that would reach real ocean)
-    step = float(f[R < 0.6 * radius].mean() - f[(R > radius + 10) & (R < radius + 35)].mean())
     dark = float(np.percentile(f[R < 0.9 * radius], 2))
-    lim = QA[kind]
+    if radius < MIN_STEP_RADIUS_PX:                              # a dot of a hole: a step over a few pixels is noise
+        step, lim = 0.0, QA[kind]
+    elif radius < LARGE_HOLE_PX:
+        # ring just outside the edge (not scaled with the radius: on big holes that would reach real ocean)
+        step = float(f[R < 0.6 * radius].mean() - f[(R > radius + 10) & (R < radius + 35)].mean())
+        # a bigger hole sits further from its ring, so some centre-vs-ring difference is natural (Sept 15 2026:
+        # radius 184, step +7.6 against a flat limit of 8); the allowance grows with the radius past 120 px
+        lim = dict(QA[kind], max_step=QA[kind]["max_step"] + 0.12 * max(0.0, radius - 120))
+    else:
+        step = float(f[(R > radius - 12) & (R < radius - 2)].mean() - f[(R > radius + 2) & (R < radius + 12)].mean())
+        lim = QA_LARGE
     reason = "ok"
     if abs(step) > lim["max_step"]:
-        reason = f"centre/ring step {step:+.1f} exceeds {lim['max_step']}"
+        reason = f"{'centre/ring' if radius < LARGE_HOLE_PX else 'edge'} step {step:+.1f} exceeds {lim['max_step']}"
     elif dark < lim["min_dark"]:
         reason = f"dark pixels {dark:.0f} below {lim['min_dark']}"
     return {"ok": reason == "ok", "radius": round(radius, 1), "step": round(step, 1), "dark": round(dark, 1),
@@ -288,6 +379,60 @@ def check_face(face: np.ndarray, hole_face: np.ndarray, kind: str) -> dict:
 
 def _gray3(a2d: np.ndarray) -> np.ndarray:
     return np.stack([a2d] * 3, axis=-1)
+
+
+def _own_data_fills(A: np.ndarray, Hm: np.ndarray, face: str, kind: str, log, rep: dict, label: str):
+    """Fills that need no infrared, best first; returns the accepted face or None (rep gets the method).
+
+    Small hole: spread the surrounding clouds/ice inward plus Google's texture, then spread alone, then
+    Google's whole tile. Big winter hole (radius >= LARGE_HOLE_PX): the surroundings are ocean and cloud
+    while the pole is ice, so spreading them inward gets the tone wrong -- Google's tile goes first."""
+    names = {"pz": ("cloud fill + Google texture", "cloud fill"), "nz": ("ice fill + Google texture", "ice fill")}[face]
+    attempts = [(names[0], lambda: fill_hole(A, Hm, face)),
+                (names[1], lambda: fill_hole(A, Hm, None)),
+                ("Google tile", lambda: google_tile_fill(A, Hm, face))]
+    if np.sqrt((Hm > 0.5).sum() / np.pi) >= LARGE_HOLE_PX:
+        attempts = [attempts[2], attempts[0], attempts[1]]
+    for method, make in attempts:
+        cand = make()
+        if cand is None:
+            log(f"{label} {method}: asset missing")
+            continue
+        qa = check_face(cand, Hm, kind)
+        log(f"{label} {method}: {qa['reason']}")
+        if qa["ok"]:
+            rep.update(method=method, qa=qa)
+            return cand
+        rep.setdefault("rejected", []).append({"method": method, **qa})
+    return None
+
+
+def _infrared_fill(A, Hm, cloud_gray, kind, target_day, width, fetch, log, rep, label):
+    """Infrared overlay for one pole (kind 'north'/'south'), or None. The south pole is mirrored so the
+    same routine serves both (nz == pz of the flipped map, mirrored left-right: verified exactly).
+    Tries the newest complete infrared day; if its fill fails the quality check (a day still being
+    finished can pass the completeness test and still have holes), tries the next older day."""
+    south = kind == "south"
+    flip = (lambda a: a[:, ::-1]) if south else (lambda a: a)
+    cg = cloud_gray[::-1] if south else cloud_gray
+    start = target_day
+    for _ in range(IR_QA_RETRIES):
+        got = fetch_polar_infrared(start, width, fetch, log, south=south)
+        if got is None:
+            rep.setdefault("no_infrared", "no complete infrared (layer only covers the dark side)")
+            return None
+        ir, ir_day = got
+        for force_smooth in (False, True):
+            cand, info = arctic_overlay(flip(A), flip(Hm), ir, cg, force_smooth)
+            cand = flip(cand)
+            qa = check_face(cand, Hm, kind)
+            log(f"{label} {ir_day} {'smooth' if force_smooth else 'patch'} fill: {qa['reason']} {info}")
+            if qa["ok"]:
+                rep.update(method="infrared overlay", ir_day=str(ir_day), qa=qa, **info)
+                return cand
+            rep.setdefault("rejected", []).append({"ir_day": str(ir_day), "smooth": force_smooth, **qa})
+        start = ir_day - timedelta(days=1)
+    return None
 
 
 def apply_polar_fixes(faces: dict, cloud_gray: np.ndarray, target_day, width: int, log=print,
@@ -301,53 +446,16 @@ def apply_polar_fixes(faces: dict, cloud_gray: np.ndarray, target_day, width: in
     hole_n = north_hole(cloud_gray)
     rep = report["north"] = {"hole": bool(hole_n.any())}
     if hole_n.any():
-        Hm = _face(hole_n * 255, "pz") / 255.0
+        Hm = grow_face_hole(_face(hole_n * 255, "pz") / 255.0)
         A = faces["pz"][..., 0].astype(np.float32)
         out = None
         if not use_ir:
             rep["no_infrared"] = "disabled"
         else:
-            # Try the newest complete infrared day; if its fill fails the quality check (a day still being
-            # finished can pass the completeness test and still have holes), try the next older day.
-            start = target_day
-            for _ in range(IR_QA_RETRIES):
-                got = fetch_polar_infrared(start, width, fetch, log)
-                if got is None:
-                    rep.setdefault("no_infrared", "no complete infrared (layer only covers the dark side)")
-                    break
-                ir, ir_day = got
-                for force_smooth in (False, True):
-                    cand, info = arctic_overlay(A, Hm, ir, cloud_gray, force_smooth)
-                    qa = check_face(cand, Hm, "north")
-                    log(f"arctic {ir_day} {'smooth' if force_smooth else 'patch'} fill: {qa['reason']} {info}")
-                    if qa["ok"]:
-                        out = cand
-                        rep.update(method="infrared overlay", ir_day=str(ir_day), qa=qa, **info)
-                        break
-                    rep.setdefault("rejected", []).append({"ir_day": str(ir_day), "smooth": force_smooth, **qa})
-                if out is not None:
-                    break
-                start = ir_day - timedelta(days=1)
-        if out is None:                                         # same method as Antarctica
-            Hg = _face(north_hole_grown(cloud_gray).astype(np.float32) * 255, "pz") / 255.0
-            for donor in ("pz", None):
-                cand = fill_hole(A, Hg, donor)
-                qa = check_face(cand, Hg, "north")
-                log(f"arctic ice fill ({'with' if donor else 'without'} Google texture): {qa['reason']}")
-                if qa["ok"]:
-                    out = cand
-                    rep.update(method="cloud fill + Google texture" if donor else "cloud fill", qa=qa)
-                    break
-                rep.setdefault("rejected", []).append({"donor": bool(donor), **qa})
-        if out is None:                                         # last resort: Google's whole tile, not an empty disc
-            cand = google_tile_fill(A, Hg, "pz")
-            qa = check_face(cand, Hg, "north") if cand is not None else None
-            log(f"arctic Google tile: {qa['reason'] if qa else 'asset missing'}")
-            if qa and qa["ok"]:
-                out = cand
-                rep.update(method="Google tile", qa=qa)
-            elif qa:
-                rep.setdefault("rejected", []).append({"google_tile": True, **qa})
+            out = _infrared_fill(A, Hm, cloud_gray, "north", target_day, width, fetch, log, rep, "arctic")
+        if out is None:                                         # no usable infrared: same fills as Antarctica
+            Hg = grow_face_hole(_face(north_hole_grown(cloud_gray).astype(np.float32) * 255, "pz") / 255.0)
+            out = _own_data_fills(A, Hg, "pz", "north", log, rep, "arctic")
         if out is not None:
             faces["pz"] = _gray3(out)
         else:
@@ -359,27 +467,13 @@ def apply_polar_fixes(faces: dict, cloud_gray: np.ndarray, target_day, width: in
     hole_s = south_hole(cloud_gray)
     rep = report["south"] = {"hole": bool(hole_s.any())}
     if hole_s.any():
-        Hm = _face(hole_s.astype(np.float32) * 255, "nz") / 255.0
+        Hm = grow_face_hole(_face(hole_s.astype(np.float32) * 255, "nz") / 255.0)
         A = faces["nz"][..., 0].astype(np.float32)
         out = None
-        for donor in ("nz", None):
-            cand = fill_hole(A, Hm, donor)
-            qa = check_face(cand, Hm, "south")
-            log(f"antarctic fill ({'with' if donor else 'without'} Google texture): {qa['reason']}")
-            if qa["ok"]:
-                out = cand
-                rep.update(method="ice fill + Google texture" if donor else "ice fill", qa=qa)
-                break
-            rep.setdefault("rejected", []).append({"donor": bool(donor), **qa})
-        if out is None:                                         # last resort: Google's whole tile, not an empty disc
-            cand = google_tile_fill(A, Hm, "nz")
-            qa = check_face(cand, Hm, "south") if cand is not None else None
-            log(f"antarctic Google tile: {qa['reason'] if qa else 'asset missing'}")
-            if qa and qa["ok"]:
-                out = cand
-                rep.update(method="Google tile", qa=qa)
-            elif qa:
-                rep.setdefault("rejected", []).append({"google_tile": True, **qa})
+        if use_ir:                                              # the south pole is the dark side in Apr-Sep
+            out = _infrared_fill(A, Hm, cloud_gray, "south", target_day, width, fetch, log, rep, "antarctic")
+        if out is None:
+            out = _own_data_fills(A, Hm, "nz", "south", log, rep, "antarctic")
         if out is not None:
             faces["nz"] = _gray3(out)
         else:
