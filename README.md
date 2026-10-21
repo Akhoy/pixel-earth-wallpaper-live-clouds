@@ -83,6 +83,17 @@ that copy first if one is installed.
 shared for preservation and personal use. All rights to the original app and
 its assets remain with Google.
 
+## Polar holes and the date line
+
+VIIRS true-color needs daylight, so each pole is blank for part of the year, and the daily mosaic's two
+edges (the date line) were photographed ~24h apart. `pipeline/polar.py` fills each pole on its cube face
+-- Arctic from thermal infrared (VIIRS M15) when it exists, otherwise by spreading the surrounding clouds
+plus texture from Google's stock tile (`pipeline/assets/`); Antarctica the second way -- and checks the
+result, falling back to safer fills (last resort: the hole fades to "no cloud"). `merge.soften_dateline`
+cross-fades the date-line seam. Each run writes `_debug_polar_report.json` saying which fill ran. The
+Arctic infrared fill is cosmetic (infrared reads cold ice as cloud). Tests: `python -m unittest discover -s tests`.
+Needs `scipy` (in requirements.txt).
+
 ## Repo layout
 
 - `pipeline/run_pipeline.py` — the daily cloud-mask job (entry point run by CI)

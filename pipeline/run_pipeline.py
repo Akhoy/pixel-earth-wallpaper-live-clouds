@@ -14,8 +14,10 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 from gibs import fetch_global_truecolor
-from merge import darkest_of_n_composite, median_of_masks, fill_from_cache, inpaint_remaining_gaps, validity_mask
-from cloud_mask import rgb_to_cloud_mask, fix_antarctic_cap
+from merge import (darkest_of_n_composite, median_of_masks, fill_from_cache, inpaint_remaining_gaps, validity_mask,
+                   find_polar_hole, soften_dateline)
+from polar import apply_polar_fixes
+from cloud_mask import rgb_to_cloud_mask
 from cubemap import equirect_to_cubemap, FACE_ORDER
 from dxt1 import encode_tile_to_dds
 
@@ -81,16 +83,19 @@ def _fetch_and_composite(day, width: int):
     return cloud_gray, still_gap, coverage, debug_rgb
 
 
-def _write_tileset(equirect_rgb: np.ndarray, dest_dir: Path) -> int:
+def _write_tileset(equirect_rgb: np.ndarray, dest_dir: Path, polar_fix=None) -> int:
     """Reproject an equirect RGB array (uint8, or float 0..1) to 6 cube faces
     in the cloudMap sampling convention (Z-polar, via cloudTransformMatrix --
     see cubemap.py) and write DDS tiles + debug face PNGs into dest_dir.
-    Returns the tile count.
+    polar_fix, if given, is called with the faces dict and returns the faces
+    to publish (see polar.py). Returns the tile count.
     """
     if equirect_rgb.dtype != np.uint8:
         equirect_rgb = np.clip(equirect_rgb * 255, 0, 255).astype(np.uint8)
     dest_dir.mkdir(parents=True, exist_ok=True)
     faces = equirect_to_cubemap(equirect_rgb, FACE_SIZE)
+    if polar_fix is not None:
+        faces = polar_fix(faces)
     face_index = {name: i for i, name in enumerate(FACE_ORDER)}
     tile_count = 0
     for name, face_arr in faces.items():
@@ -108,7 +113,7 @@ def _write_tileset(equirect_rgb: np.ndarray, dest_dir: Path) -> int:
 
 def build(width: int, out_dir: Path, target_day=None, cache_dir: Path = CACHE_DIR, use_cache_fallback: bool = True,
           base_url_prefix: str = "http://localhost:8765", keep_versions: int = 5,
-          min_coverage: float = MIN_DAY_COVERAGE):
+          min_coverage: float = MIN_DAY_COVERAGE, polar_fade: int = 40, use_polar_ir: bool = True):
     """out_dir is a STABLE directory: it holds root.json (always at the same
     URL) plus a versions/ subfolder. Each run publishes tiles into a NEW
     versions/<timestamp>/ folder and points root.json's baseUrl at it -- so
@@ -159,6 +164,10 @@ def build(width: int, out_dir: Path, target_day=None, cache_dir: Path = CACHE_DI
         else:
             log(f"{fallback_day} is no better ({100*alt_coverage:.1f}%) -- keeping {target_day}")
 
+    # The mosaic's two edges (the date line) were photographed ~24h apart, which
+    # shows as a hard straight line across the nx and nz faces. Cross-fade it.
+    cloud_gray = soften_dateline(cloud_gray, still_gap)
+
     # fill_from_cache/inpaint_remaining_gaps operate on RGB; run the
     # single-channel mask through them as a replicated-3-channel "pseudo-RGB"
     # rather than duplicating that gap-filling logic for a 2D array.
@@ -167,6 +176,15 @@ def build(width: int, out_dir: Path, target_day=None, cache_dir: Path = CACHE_DI
     if cached is not None and cached.shape != cloud_gray.shape:
         cached = None
 
+    # The polar caps have no photo and no honest cache/inpaint fill (those
+    # smear a fake ring there), so keep them out of both. They are filled on
+    # the cube faces afterwards by polar.py.
+    polar_hole = find_polar_hole(still_gap)
+    if polar_hole.any():
+        log(f"polar hole: {100*polar_hole.mean():.2f}% of globe has no photo (filled by polar.py)")
+    still_gap = still_gap * (1.0 - polar_hole)
+
+    raw_gray = cloud_gray            # before cache/inpaint touch it, for restoring the polar holes below
     pseudo = np.stack([cloud_gray] * 3, axis=-1)
     cached_pseudo = np.stack([cached] * 3, axis=-1) if cached is not None else None
     pseudo = fill_from_cache(pseudo, still_gap, cached_pseudo)
@@ -184,7 +202,10 @@ def build(width: int, out_dir: Path, target_day=None, cache_dir: Path = CACHE_DI
         log(f"inpainting {100*remaining_gap.mean():.2f}% still-gapped pixels ...")
         pseudo = inpaint_remaining_gaps(pseudo, remaining_gap)
 
-    cloud_gray = pseudo[..., 0]
+    # The thin satellite gaps run right up to the polar holes, so cache blending and inpainting smear
+    # non-zero values into the hole's edge. polar.py finds each hole by its solid zeros, so put them back
+    # (this also keeps the smear out of the saved cache).
+    cloud_gray = np.where(polar_hole > 0.5, raw_gray, pseudo[..., 0])
     np.save(cache_file, cloud_gray)
     Image.fromarray(debug_rgb).save(version_dir / "_debug_equirect_merged.png")
 
@@ -193,12 +214,20 @@ def build(width: int, out_dir: Path, target_day=None, cache_dir: Path = CACHE_DI
     # (a white cloud mask, sampled via .r and blended over the static bundled
     # dayMap/nightMap textures). App-side code and earth.frag are untouched;
     # all quality work happens here, server-side.
-    cloud_gray = fix_antarctic_cap(cloud_gray)
     cloud_rgb = np.stack([cloud_gray] * 3, axis=-1)
     Image.fromarray(cloud_gray).save(version_dir / "_debug_cloud_mask.png")
 
     log("building live cloudMap texture from the mask ...")
-    tile_count = _write_tileset(cloud_rgb, version_dir)
+    polar_report = {}
+
+    def polar_fix(faces):
+        fixed, rep = apply_polar_fixes(faces, cloud_gray, target_day, width, log=log,
+                                       use_ir=use_polar_ir, fade_radius=polar_fade)
+        polar_report.update(rep)
+        return fixed
+
+    tile_count = _write_tileset(cloud_rgb, version_dir, polar_fix)
+    (version_dir / "_debug_polar_report.json").write_text(json.dumps(polar_report, indent=2))
     log(f"wrote {tile_count} DDS tiles -> {version_dir}")
 
     # root.json stays at a STABLE url; only its baseUrl content changes each
@@ -229,8 +258,14 @@ if __name__ == "__main__":
     ap.add_argument("--min-coverage", type=float, default=MIN_DAY_COVERAGE,
                      help="fall back a day if the chosen day is covered less than this "
                           "(0-1; a complete day is ~0.87). 0 disables the check.")
+    ap.add_argument("--polar-fade", type=int, default=40,
+                     help="last-resort fallback: blur radius (px on a 1024 face) of the cloud fade-out around a polar "
+                          "no-data hole when its fill fails the quality check")
+    ap.add_argument("--no-polar-ir", action="store_true",
+                     help="skip the Arctic infrared fill (offline runs); the Arctic hole then fades to empty")
     args = ap.parse_args()
     target = date.fromisoformat(args.date) if args.date else None
     build(args.width, Path(args.out), target_day=target, cache_dir=Path(args.cache_dir),
           use_cache_fallback=not args.no_cache_fallback, base_url_prefix=args.base_url,
-          keep_versions=args.keep_versions, min_coverage=args.min_coverage)
+          keep_versions=args.keep_versions, min_coverage=args.min_coverage, polar_fade=args.polar_fade,
+          use_polar_ir=not args.no_polar_ir)

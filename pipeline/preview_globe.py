@@ -183,16 +183,29 @@ def main():
     ap.add_argument("--width", type=int, default=1080)
     ap.add_argument("--height", type=int, default=2400)
     ap.add_argument("--face-size", type=int, default=512)
+    ap.add_argument("--faces", default=None,
+                    help="dir of _debug_face_*.png from a pipeline run; previews the exact published "
+                         "faces (incl. polar fade) instead of reprojecting the equirect mask")
+    ap.add_argument("--season", default="Summer", choices=["Summer", "Winter", "Spring-Fall"],
+                    help="which bundled dayMap to use as the surface")
+    ap.add_argument("--utc", default=None,
+                    help="sun time as YYYY-MM-DDTHH:MM (UTC), default now. e.g. 2026-06-21T12:00 "
+                         "lights the Arctic, 2026-12-21T12:00 lights Antarctica")
     args = ap.parse_args()
 
-    mask = np.array(Image.open(args.cloudmask).convert("L"))
-    faces = equirect_to_cubemap(np.stack([mask] * 3, -1), args.face_size)
+    if args.faces:
+        faces = {n: np.array(Image.open(Path(args.faces) / f"_debug_face_{n}.png").convert("RGB"))
+                 for n in ["px", "nx", "py", "ny", "pz", "nz"]}
+    else:
+        mask = np.array(Image.open(args.cloudmask).convert("L"))
+        faces = equirect_to_cubemap(np.stack([mask] * 3, -1), args.face_size)
     clouds = {k: v.astype(np.float32) / 255.0 for k, v in faces.items()}
-    day = read_ktx_cubemap(ASSETS / "dayMap-Summer.ktx", 1)
+    day = read_ktx_cubemap(ASSETS / f"dayMap-{args.season}.ktx", 1)
     night = read_ktx_cubemap(ASSETS / "nightMap.ktx", 1)
 
     img = render(clouds, day, night, args.lat, args.lon,
-                 datetime.now(timezone.utc), args.width, args.height)
+                 (datetime.fromisoformat(args.utc).replace(tzinfo=timezone.utc) if args.utc
+                  else datetime.now(timezone.utc)), args.width, args.height)
     Image.fromarray(img).save(args.out)
     print(f"wrote {args.out}")
 

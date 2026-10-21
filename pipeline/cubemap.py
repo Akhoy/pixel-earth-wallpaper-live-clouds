@@ -131,3 +131,10 @@ def equirect_to_cubemap(img: np.ndarray, face_size: int, frame: str = "cloud") -
         sampled = sample_equirect(img, lon, lat)
         faces[face] = np.clip(sampled, 0, 255).astype(np.uint8)
     return faces
+
+
+def equirect_to_face(img: np.ndarray, face_size: int, face: str, frame: str = "cloud") -> np.ndarray:
+    """Reproject to ONE cube face (equirect_to_cubemap builds all six)."""
+    to_lonlat = direction_to_lonlat if frame == "cloud" else direction_to_lonlat_raw
+    lon, lat = to_lonlat(_face_direction_grid(face, face_size))
+    return np.clip(sample_equirect(img, lon, lat), 0, 255).astype(np.uint8)
