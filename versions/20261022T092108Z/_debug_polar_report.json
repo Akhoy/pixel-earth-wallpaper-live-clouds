@@ -6,12 +6,12 @@
     "qa": {
       "ok": true,
       "radius": 205.4,
-      "step": -10.6,
-      "dark": 32.0,
+      "step": -10.2,
+      "dark": 33.0,
       "reason": "ok"
     },
     "patch": true,
-    "patch_score": 15.1
+    "patch_score": 15.3
   },
   "south": {
     "hole": true,
@@ -19,8 +19,8 @@
     "method": "ice fill + Google texture",
     "qa": {
       "ok": true,
-      "radius": 53.9,
-      "step": -1.9,
+      "radius": 54.0,
+      "step": -1.7,
       "dark": 233.0,
       "reason": "ok"
     }
