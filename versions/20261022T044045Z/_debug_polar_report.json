@@ -1,0 +1,28 @@
+{
+  "north": {
+    "hole": true,
+    "method": "infrared overlay",
+    "ir_day": "2026-10-21",
+    "qa": {
+      "ok": true,
+      "radius": 205.4,
+      "step": -10.3,
+      "dark": 35.0,
+      "reason": "ok"
+    },
+    "patch": true,
+    "patch_score": 16.2
+  },
+  "south": {
+    "hole": true,
+    "no_infrared": "no complete infrared (layer only covers the dark side)",
+    "method": "ice fill + Google texture",
+    "qa": {
+      "ok": true,
+      "radius": 53.9,
+      "step": -2.1,
+      "dark": 234.0,
+      "reason": "ok"
+    }
+  }
+}
