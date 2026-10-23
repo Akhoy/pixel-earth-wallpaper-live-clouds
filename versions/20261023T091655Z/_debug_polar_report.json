@@ -39,8 +39,8 @@
     "method": "ice fill + Google texture",
     "qa": {
       "ok": true,
-      "radius": 50.0,
-      "step": -1.8,
+      "radius": 50.1,
+      "step": -1.5,
       "dark": 230.0,
       "reason": "ok"
     }
