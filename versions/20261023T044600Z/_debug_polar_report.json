@@ -1,0 +1,48 @@
+{
+  "north": {
+    "hole": true,
+    "rejected": [
+      {
+        "ir_day": "2026-10-21",
+        "smooth": false,
+        "ok": false,
+        "radius": 213.9,
+        "step": -1.4,
+        "dark": 22.0,
+        "reason": "dark pixels 22 below 25.0"
+      },
+      {
+        "ir_day": "2026-10-21",
+        "smooth": true,
+        "ok": false,
+        "radius": 213.9,
+        "step": -1.4,
+        "dark": 22.0,
+        "reason": "dark pixels 22 below 25.0"
+      }
+    ],
+    "method": "infrared overlay",
+    "ir_day": "2026-10-20",
+    "qa": {
+      "ok": true,
+      "radius": 213.9,
+      "step": 6.2,
+      "dark": 33.0,
+      "reason": "ok"
+    },
+    "patch": true,
+    "patch_score": 18.3
+  },
+  "south": {
+    "hole": true,
+    "no_infrared": "no complete infrared (layer only covers the dark side)",
+    "method": "ice fill + Google texture",
+    "qa": {
+      "ok": true,
+      "radius": 49.9,
+      "step": -1.5,
+      "dark": 230.0,
+      "reason": "ok"
+    }
+  }
+}
