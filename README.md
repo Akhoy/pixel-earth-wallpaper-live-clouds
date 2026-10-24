@@ -91,8 +91,9 @@ Earth dark anyway), and the daily mosaic's two edges (the date line) were photog
 `pipeline/polar.py` measures each pole's hole from that day's data and fills it with the surrounding clouds'
 brightness plus the fine texture of a **fixed** real-cloud photo (`pipeline/assets/polar_texture.png`, baked by
 `scripts/make_polar_texture.py`). Nothing is fetched and nothing needs tuning from day to day. The polar step only
-ever changes the two polar faces and can never stop an update: if it fails, the faces are published exactly as
-built (the other four always are). `merge.soften_dateline` cross-fades the date-line seam. Each run writes
+ever changes the two polar faces and can never stop an update. If the fill itself crashes for a pole, that pole
+reuses the previously published polar tiles (read from the site before the new version replaces them), and only if
+those are unavailable too is it published as built (the other four faces always are). `merge.soften_dateline` cross-fades the date-line seam. Each run writes
 `_debug_polar_report.json` saying what ran; `--no-polar` skips it.
 
 (An earlier version filled the Arctic from thermal infrared with tuned quality limits; each new season or data

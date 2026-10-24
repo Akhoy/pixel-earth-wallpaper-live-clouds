@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 import polar  # noqa: E402
 import run_pipeline  # noqa: E402
 from cubemap import equirect_to_cubemap  # noqa: E402
+from dxt1 import decode_dds_tile, encode_tile_to_dds  # noqa: E402
 from merge import find_polar_hole, inpaint_remaining_gaps, soften_dateline  # noqa: E402
 
 W, H = 1024, 512
@@ -177,6 +178,61 @@ class FillTests(unittest.TestCase):
         self.assertGreater(float(tex.std()), 20)                  # real cloud texture, not a flat image
 
 
+class PreviousPublishedTests(unittest.TestCase):
+    def test_dds_round_trip(self):
+        rng = np.random.default_rng(0)
+        g = np.clip(120 + 90 * np.sin(np.add.outer(np.arange(256) / 9.0, np.arange(256) / 13.0))
+                    + rng.normal(0, 8, (256, 256)), 0, 255).astype(np.uint8)
+        rgb = np.stack([g] * 3, -1)
+        back = decode_dds_tile(encode_tile_to_dds(rgb))
+        self.assertEqual(back.shape, rgb.shape)
+        self.assertLess(np.abs(back.astype(int) - rgb.astype(int)).mean(), 8)      # DXT1 is lossy
+
+    def _fake_site(self, faces):
+        class Resp:
+            def __init__(self, content=b"", data=None):
+                self.content, self._data = content, data
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self._data
+
+        tiles = {}
+        for name, idx in (("pz", 4), ("nz", 5)):
+            for c in range(4):
+                for r in range(4):
+                    t = faces[name][r * 256:(r + 1) * 256, c * 256:(c + 1) * 256]
+                    tiles[f"https://site/versions/v1/{idx}_2_{c}_{r}.dds"] = encode_tile_to_dds(np.stack([t] * 3, -1))
+
+        def get(url, timeout=None):
+            if url == "https://site/root.json":
+                return Resp(data={"baseUrl": "https://site/versions/v1/"})
+            return Resp(content=tiles[url])
+        return get
+
+    def test_reads_back_the_published_polar_faces(self):
+        rng = np.random.default_rng(3)
+        faces = {n: np.clip(128 + 60 * rng.standard_normal((1024, 1024)), 0, 255).astype(np.uint8) for n in ("pz", "nz")}
+        got = polar.fetch_previous_faces("https://site", log=QUIET, get=self._fake_site(faces))
+        self.assertEqual(set(got), {"pz", "nz"})
+        self.assertLess(np.abs(got["pz"].astype(int) - faces["pz"].astype(int)).mean(), 40)
+
+    def test_unreachable_or_broken_site_gives_nothing_and_never_raises(self):
+        def down(url, timeout=None):
+            raise ConnectionError("no route")
+
+        class Junk:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                raise ValueError("not json")
+        self.assertEqual(polar.fetch_previous_faces("https://site", log=QUIET, get=down), {})
+        self.assertEqual(polar.fetch_previous_faces("https://site", log=QUIET, get=lambda u, timeout=None: Junk()), {})
+
+
 class DriverTests(unittest.TestCase):
     """The guarantees: the equator is never touched, and nothing here can raise."""
 
@@ -203,19 +259,43 @@ class DriverTests(unittest.TestCase):
         self.assertFalse(rep["arctic"]["hole"] or rep["antarctic"]["hole"])
         self.assertTrue(np.array_equal(out["pz"], faces["pz"]) and np.array_equal(out["nz"], faces["nz"]))
 
-    def test_a_fill_that_raises_leaves_the_plain_face_and_does_not_raise(self):
+    def test_normal_day_never_fetches_the_previous_tiles(self):
+        called = []
+        run(get_previous=lambda: called.append(1) or {})
+        self.assertEqual(called, [])
+
+    def test_a_crashing_fill_uses_the_previously_published_tiles(self):
+        def boom(*a, **k):
+            raise RuntimeError("fill exploded")
+        previous = {"pz": np.full((1024, 1024), 205, np.uint8), "nz": np.full((1024, 1024), 215, np.uint8)}
+        fetched = []
+        saved = polar.fill_hole
+        polar.fill_hole = boom
+        try:
+            faces, out, rep = run(get_previous=lambda: fetched.append(1) or previous)
+        finally:
+            polar.fill_hole = saved
+        self.assertEqual(rep["arctic"]["method"], "last published tiles")
+        self.assertEqual(rep["antarctic"]["method"], "last published tiles")
+        self.assertIn("fill exploded", rep["arctic"]["error"])
+        self.assertEqual(fetched, [1], "fetched once, not once per pole")
+        R = polar._radius_grid()
+        self.assertGreater(float(out["pz"][..., 0][R < 40].mean()), 150)            # yesterday's pole, not black
+        self._assert_equator_untouched(faces, out)
+
+    def test_a_crash_with_no_previous_tiles_leaves_the_plain_face_and_does_not_raise(self):
         def boom(*a, **k):
             raise RuntimeError("fill exploded")
         saved = polar.fill_hole
         polar.fill_hole = boom
         try:
-            faces, out, rep = run()
+            for getter in (None, lambda: {}, boom):
+                faces, out, rep = run(get_previous=getter)
+                self.assertEqual(rep["arctic"]["method"], "plain (error)")
+                for n in faces:
+                    self.assertTrue(np.array_equal(out[n], faces[n]), n)
         finally:
             polar.fill_hole = saved
-        self.assertEqual(rep["arctic"]["method"], "plain (error)")
-        self.assertIn("fill exploded", rep["arctic"]["error"])
-        for n in faces:
-            self.assertTrue(np.array_equal(out[n], faces[n]), n)
 
     def test_one_pole_failing_does_not_stop_the_other(self):
         def boom(cm):
@@ -239,7 +319,7 @@ class DriverTests(unittest.TestCase):
         try:
             faces = faces_of(synthetic_mask())
             report = {}
-            out = run_pipeline.apply_polar_safely(faces, synthetic_mask(), report)
+            out = run_pipeline.apply_polar_safely(faces, synthetic_mask(), "http://localhost:1", report)
         finally:
             run_pipeline.apply_polar_fixes = saved
         for n in faces:

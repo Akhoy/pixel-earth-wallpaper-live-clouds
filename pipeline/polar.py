@@ -10,20 +10,24 @@ season or data outage broke a rule. This version has nothing to tune day to day 
      fine texture of a FIXED real-cloud photo (pipeline/assets/polar_texture.png) scaled to the contrast of the
      surroundings.
 
-Only the two polar faces are ever touched, and any error here leaves the face exactly as it was:
-apply_polar_fixes never raises, so the other four faces are always published untouched.
-(Fallbacks that reused yesterday's published tiles or faded the hole to empty were tried and looked worse than
-the fill itself, so they were removed.)
+Only the two polar faces are ever touched, and apply_polar_fixes never raises, so the other four faces are
+always published untouched. The fixed-texture fill is the only thing used on a normal day. If it CRASHES for a
+pole, that pole falls back to the previously published polar tiles (read from the site before this run replaces
+them), and only if those are unavailable too is the face left plain. (Quality-based fallbacks -- reusing
+yesterday's tiles because a fill "looked bad", or fading the hole to empty -- were tried and looked worse than the
+fill itself, so only an outright crash triggers it.)
 """
 from __future__ import annotations
 
 from pathlib import Path
 
 import numpy as np
+import requests
 from PIL import Image
 from scipy.ndimage import (binary_closing, binary_dilation, distance_transform_edt, gaussian_filter, label, zoom)
 
 from cubemap import equirect_to_face
+from dxt1 import decode_dds_tile
 
 FACE_SIZE = 1024
 REF_WIDTH = 4096              # map width the pixel-sized constants below were tuned at (they scale with the width)
@@ -172,30 +176,83 @@ def fill_hole(photo_face: np.ndarray, hole_face: np.ndarray, face_name: str) -> 
     return np.clip(A * (1 - w) + base * w, 0, 255).astype(np.uint8)
 
 
+# ------------------------------------------------------------------ last published tiles (crash fallback only)
+
+def fetch_previous_faces(base_url: str, log=print, get=requests.get, timeout: float = 15.0) -> dict:
+    """The polar faces ({"pz": 2-D uint8, "nz": ...}) of the version currently published at base_url (its root.json
+    points at the tiles; this runs before the new version replaces them), decoded from the DDS tiles. {} if
+    unreachable -- local runs point at localhost, so this simply returns {} there."""
+    try:
+        root = get(f"{base_url.rstrip('/')}/root.json", timeout=timeout)
+        root.raise_for_status()
+        tiles = root.json()["baseUrl"]
+        out = {}
+        for name, idx in (("pz", 4), ("nz", 5)):
+            face = np.zeros((FACE_SIZE, FACE_SIZE), np.uint8)
+            for c in range(4):
+                for r in range(4):
+                    resp = get(f"{tiles}{idx}_2_{c}_{r}.dds", timeout=timeout)
+                    resp.raise_for_status()
+                    face[r * 256:(r + 1) * 256, c * 256:(c + 1) * 256] = decode_dds_tile(resp.content)[..., 0]
+            out[name] = face
+        return out
+    except Exception as exc:                                      # network, JSON, decode: all mean "not available"
+        log(f"previous published polar tiles unavailable: {exc}")
+        return {}
+
+
+def _use_previous(plain_face: np.ndarray, previous: np.ndarray) -> np.ndarray:
+    """Put the previously published pole into the hole of today's face. Used only when the fill crashed, so the
+    hole is found the simple way (the pixels with no data, around the pole) and blended over a soft edge."""
+    A = plain_face[..., 0].astype(np.float32)
+    R = _radius_grid()
+    nodata = binary_closing((A < 1) & (R < 420), iterations=3).astype(np.float32)
+    try:
+        nodata = grow_face_hole(nodata, A)                       # also cover the dim band around a winter hole
+    except Exception:
+        pass
+    hole = np.clip(2 * _blur(nodata, 12), 0, 1)
+    return np.clip(A * (1 - hole) + previous.astype(np.float32) * hole, 0, 255).astype(np.uint8)
+
+
 # ------------------------------------------------------------------ driver
 
 def _gray3(a2d: np.ndarray) -> np.ndarray:
     return np.stack([a2d] * 3, axis=-1)
 
 
-def apply_polar_fixes(faces: dict, cloud_gray: np.ndarray, log=print):
+def apply_polar_fixes(faces: dict, cloud_gray: np.ndarray, log=print, get_previous=None):
     """Returns (faces, report). `faces` maps name -> HxWx3 uint8 cube faces built from cloud_gray; only pz and nz
-    can change. Never raises: whatever goes wrong at a pole, that face (and the other four) come back exactly as
-    given."""
+    can change. Never raises. get_previous: optional callable returning {"pz": 2-D uint8, "nz": ...}; it is only
+    called if a fill crashes, and then only the first time."""
     faces = dict(faces)
     report = {}
+    previous = {}
     for kind, face, measure in (("arctic", "pz", north_hole), ("antarctic", "nz", south_hole)):
         rep = report[kind] = {"hole": False}
+        plain = faces[face]
         try:
             hole = measure(cloud_gray)
             if not hole.any():
                 continue
-            A = faces[face][..., 0].astype(np.float32)
+            rep["hole"] = True
+            A = plain[..., 0].astype(np.float32)
             Hm = grow_face_hole(_face(hole.astype(np.float32) * 255, face) / 255.0, A)
             faces[face] = _gray3(fill_hole(A, Hm, face))
-            rep.update(hole=True, method="fixed texture fill", radius=round(_hole_radius(Hm), 1))
+            rep.update(method="fixed texture fill", radius=round(_hole_radius(Hm), 1))
             log(f"{kind}: fixed texture fill (hole radius {rep['radius']} px)")
-        except Exception as exc:                                  # leave this pole plain, carry on
-            log(f"{kind}: polar fix failed, leaving the plain face: {exc!r}")
-            report[kind] = {"hole": True, "method": "plain (error)", "error": repr(exc)}
+        except Exception as exc:                                  # the fill crashed: use the last published pole
+            log(f"{kind}: fixed texture fill failed ({exc!r})")
+            report[kind] = rep = {"hole": True, "method": "plain (error)", "error": repr(exc)}
+            faces[face] = plain
+            try:
+                if get_previous is not None and not previous:
+                    previous.update(get_previous() or {})
+                if face in previous:
+                    faces[face] = _gray3(_use_previous(plain, previous[face]))
+                    rep["method"] = "last published tiles"
+                    log(f"{kind}: using the previously published tiles")
+            except Exception as exc2:                             # even that failed: leave the plain face
+                log(f"{kind}: previous tiles unusable ({exc2!r}); leaving the plain face")
+                faces[face] = plain
     return faces, report
