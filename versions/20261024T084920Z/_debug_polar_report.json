@@ -7,7 +7,7 @@
         "smooth": false,
         "ok": false,
         "radius": 220.7,
-        "step": 4.4,
+        "step": 2.7,
         "dark": 18.0,
         "reason": "dark pixels 18 below 25.0"
       },
@@ -16,7 +16,7 @@
         "smooth": true,
         "ok": false,
         "radius": 220.7,
-        "step": 4.4,
+        "step": 2.7,
         "dark": 18.0,
         "reason": "dark pixels 18 below 25.0"
       },
@@ -73,8 +73,8 @@
     "qa": {
       "ok": true,
       "radius": 46.9,
-      "step": -2.5,
-      "dark": 233.0,
+      "step": -1.9,
+      "dark": 232.0,
       "reason": "ok"
     }
   }
