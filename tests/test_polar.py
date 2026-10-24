@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 import polar  # noqa: E402
 import run_pipeline  # noqa: E402
 from cubemap import equirect_to_cubemap  # noqa: E402
-from dxt1 import decode_dds_tile, encode_tile_to_dds  # noqa: E402
 from merge import find_polar_hole, inpaint_remaining_gaps, soften_dateline  # noqa: E402
 
 W, H = 1024, 512
@@ -120,14 +119,16 @@ class FillTests(unittest.TestCase):
         Hm = polar.grow_face_hole(polar._face(polar.south_hole(cm).astype(np.float32) * 255, "nz") / 255.0)
         return faces_of(cm)["nz"][..., 0].astype(np.float32), Hm
 
-    def test_fill_passes_the_sanity_check_with_and_without_the_texture(self):
+    def test_fill_is_cloud_coloured_with_and_without_the_texture(self):
         A, Hm = self._south()
+        R = polar._radius_grid()
         saved = polar.TEXTURE_PATH
         try:
             for path in (saved, Path("/nonexistent/texture.png")):
                 polar.TEXTURE_PATH = path
-                ok, why = polar.fill_looks_ok(polar.fill_hole(A, Hm, "nz"), Hm)
-                self.assertTrue(ok, why)
+                out = polar.fill_hole(A, Hm, "nz").astype(float)
+                self.assertGreater(float(out[R < 60].mean()), 200)          # bright ice around it -> bright fill
+                self.assertTrue(np.isfinite(out).all())
         finally:
             polar.TEXTURE_PATH = saved
 
@@ -176,98 +177,6 @@ class FillTests(unittest.TestCase):
         self.assertGreater(float(tex.std()), 20)                  # real cloud texture, not a flat image
 
 
-class SanityTests(unittest.TestCase):
-    def _hole(self, r=205):
-        return (polar._radius_grid() < r).astype(np.float32)
-
-    def test_a_dead_fill_is_caught(self):
-        R, hole = polar._radius_grid(), self._hole()
-        good = np.full(R.shape, 190, np.uint8)
-        self.assertTrue(polar.fill_looks_ok(good, hole)[0])
-        dead = good.copy()
-        dead[R < 200] = 8
-        self.assertFalse(polar.fill_looks_ok(dead, hole)[0])
-
-    def test_a_hard_edge_is_caught(self):
-        R, hole = polar._radius_grid(), self._hole()
-        face = np.where(R < 205, 250, 60).astype(np.uint8)
-        self.assertFalse(polar.fill_looks_ok(face, hole)[0])
-
-    def test_a_good_fill_with_dark_patches_is_not_rejected(self):
-        """Regression (Oct 23 2026): three good Arctic fills were rejected because 'the darkest 2% was below 25'
-        -- clear Arctic water is dark -- and Google's blocky April tile was published instead for three days. A
-        fill is dead when it is MOSTLY black, not when part of it is."""
-        R, hole = polar._radius_grid(), self._hole()
-        face = np.full(R.shape, 190, np.uint8)
-        face[(R > 40) & (R < 120) & (np.abs(np.sin(R / 7.0)) > 0.985)] = 10      # thin dark arcs, a few percent
-        frac = float((face[R < 0.9 * 205] < polar.DARK_LEVEL).mean())
-        self.assertTrue(0.01 < frac < 0.08, frac)
-        self.assertTrue(polar.fill_looks_ok(face, hole)[0])
-
-    def test_tiny_holes_and_non_finite_pixels(self):
-        R = polar._radius_grid()
-        self.assertTrue(polar.fill_looks_ok(np.zeros(R.shape, np.uint8), (R < 5).astype(np.float32))[0])
-        bad = np.full(R.shape, 190.0, np.float32)
-        bad[100, 100] = np.nan
-        self.assertFalse(polar.fill_looks_ok(bad, self._hole())[0])
-
-
-class PreviousPublishedTests(unittest.TestCase):
-    def test_dds_round_trip(self):
-        rng = np.random.default_rng(0)
-        g = np.clip(120 + 90 * np.sin(np.add.outer(np.arange(256) / 9.0, np.arange(256) / 13.0))
-                    + rng.normal(0, 8, (256, 256)), 0, 255).astype(np.uint8)
-        rgb = np.stack([g] * 3, -1)
-        back = decode_dds_tile(encode_tile_to_dds(rgb))
-        self.assertEqual(back.shape, rgb.shape)
-        self.assertLess(np.abs(back.astype(int) - rgb.astype(int)).mean(), 8)      # DXT1 is lossy
-
-    def _fake_site(self, faces):
-        """A fake `requests.get` serving root.json and the 32 polar tiles for the given {pz,nz} 2-D faces."""
-        class Resp:
-            def __init__(self, content=b"", data=None):
-                self.content, self._data = content, data
-
-            def raise_for_status(self):
-                pass
-
-            def json(self):
-                return self._data
-
-        tiles = {}
-        for name, idx in (("pz", 4), ("nz", 5)):
-            for c in range(4):
-                for r in range(4):
-                    t = faces[name][r * 256:(r + 1) * 256, c * 256:(c + 1) * 256]
-                    tiles[f"https://site/versions/v1/{idx}_2_{c}_{r}.dds"] = encode_tile_to_dds(np.stack([t] * 3, -1))
-
-        def get(url, timeout=None):
-            if url == "https://site/root.json":
-                return Resp(data={"baseUrl": "https://site/versions/v1/"})
-            return Resp(content=tiles[url])
-        return get
-
-    def test_reads_back_the_published_polar_faces(self):
-        rng = np.random.default_rng(3)
-        faces = {n: np.clip(128 + 60 * rng.standard_normal((1024, 1024)), 0, 255).astype(np.uint8) for n in ("pz", "nz")}
-        got = polar.fetch_previous_faces("https://site", log=QUIET, get=self._fake_site(faces))
-        self.assertEqual(set(got), {"pz", "nz"})
-        self.assertLess(np.abs(got["pz"].astype(int) - faces["pz"].astype(int)).mean(), 40)
-
-    def test_unreachable_or_broken_site_gives_nothing_and_never_raises(self):
-        def down(url, timeout=None):
-            raise ConnectionError("no route")
-
-        class Junk:
-            def raise_for_status(self):
-                pass
-
-            def json(self):
-                raise ValueError("not json")
-        self.assertEqual(polar.fetch_previous_faces("https://site", log=QUIET, get=down), {})
-        self.assertEqual(polar.fetch_previous_faces("https://site", log=QUIET, get=lambda u, timeout=None: Junk()), {})
-
-
 class DriverTests(unittest.TestCase):
     """The guarantees: the equator is never touched, and nothing here can raise."""
 
@@ -278,14 +187,15 @@ class DriverTests(unittest.TestCase):
             self.assertTrue(np.array_equal(out[n], faces[n]), n)
 
     def test_fills_both_poles_and_never_touches_the_equator(self):
-        called = []
-        faces, out, rep = run(get_previous=lambda: called.append(1) or {})
+        faces, out, rep = run()
         self.assertEqual(rep["arctic"]["method"], "fixed texture fill")
         self.assertEqual(rep["antarctic"]["method"], "fixed texture fill")
         self.assertFalse(np.array_equal(out["pz"], faces["pz"]))
         self.assertFalse(np.array_equal(out["nz"], faces["nz"]))
+        R = polar._radius_grid()
+        for n in ("pz", "nz"):                                  # filled with cloud, not left black
+            self.assertGreater(float(out[n][..., 0][R < 40].mean()), 60, n)
         self._assert_equator_untouched(faces, out)
-        self.assertEqual(called, [], "previous tiles are only fetched when a fill fails")
 
     def test_complete_pole_is_untouched(self):
         cm = synthetic_mask(south_hole_lat=-90, north_hole_lat=90, fringe=False)
@@ -293,54 +203,17 @@ class DriverTests(unittest.TestCase):
         self.assertFalse(rep["arctic"]["hole"] or rep["antarctic"]["hole"])
         self.assertTrue(np.array_equal(out["pz"], faces["pz"]) and np.array_equal(out["nz"], faces["nz"]))
 
-    def test_a_broken_fill_reuses_the_last_published_tiles(self):
-        previous = {"pz": np.full((1024, 1024), 200, np.uint8), "nz": np.full((1024, 1024), 210, np.uint8)}
-        saved = polar.fill_hole
-        polar.fill_hole = lambda A, Hm, face: np.zeros(A.shape, np.uint8)               # a dead fill
-        try:
-            faces, out, rep = run(get_previous=lambda: previous)
-        finally:
-            polar.fill_hole = saved
-        self.assertEqual(rep["arctic"]["method"], "last published")
-        self.assertEqual(rep["antarctic"]["method"], "last published")
-        R = polar._radius_grid()
-        self.assertGreater(float(out["pz"][..., 0][R < 40].mean()), 150)                 # yesterday's, not black
-        self._assert_equator_untouched(faces, out)
-
-    def test_a_broken_fill_and_no_previous_fades_to_empty(self):
-        saved = polar.fill_hole
-        polar.fill_hole = lambda A, Hm, face: np.zeros(A.shape, np.uint8)
-        try:
-            faces, out, rep = run(get_previous=lambda: {})
-        finally:
-            polar.fill_hole = saved
-        self.assertEqual(rep["arctic"]["method"], "fade to empty")
-        self._assert_equator_untouched(faces, out)
-
-    def test_a_fill_that_raises_falls_through_to_the_last_published_tiles(self):
+    def test_a_fill_that_raises_leaves_the_plain_face_and_does_not_raise(self):
         def boom(*a, **k):
             raise RuntimeError("fill exploded")
         saved = polar.fill_hole
         polar.fill_hole = boom
         try:
-            faces, out, rep = run(get_previous=lambda: {"pz": np.full((1024, 1024), 180, np.uint8),
-                                                        "nz": np.full((1024, 1024), 180, np.uint8)})
+            faces, out, rep = run()
         finally:
             polar.fill_hole = saved
-        self.assertEqual(rep["arctic"]["method"], "last published")
-        self.assertIn("fill exploded", rep["arctic"]["error"])
-
-    def test_everything_failing_leaves_the_plain_faces_and_does_not_raise(self):
-        def boom(*a, **k):
-            raise RuntimeError("boom")
-        saved = (polar.fill_hole, polar.fade_to_hole)
-        polar.fill_hole = polar.fade_to_hole = boom
-        try:
-            faces, out, rep = run(get_previous=boom)
-        finally:
-            polar.fill_hole, polar.fade_to_hole = saved
         self.assertEqual(rep["arctic"]["method"], "plain (error)")
-        self.assertEqual(rep["antarctic"]["method"], "plain (error)")
+        self.assertIn("fill exploded", rep["arctic"]["error"])
         for n in faces:
             self.assertTrue(np.array_equal(out[n], faces[n]), n)
 
@@ -366,7 +239,7 @@ class DriverTests(unittest.TestCase):
         try:
             faces = faces_of(synthetic_mask())
             report = {}
-            out = run_pipeline.apply_polar_safely(faces, synthetic_mask(), "http://localhost:1", 40, report)
+            out = run_pipeline.apply_polar_safely(faces, synthetic_mask(), report)
         finally:
             run_pipeline.apply_polar_fixes = saved
         for n in faces:

@@ -124,23 +124,3 @@ def encode_tile_to_dds(rgb: np.ndarray) -> bytes:
     h, w = rgb.shape[0], rgb.shape[1]
     data = encode_dxt1(rgb)
     return write_dds(w, h, data)
-
-
-def decode_dds_tile(dds: bytes) -> np.ndarray:
-    """Inverse of encode_tile_to_dds: a DXT1 DDS file -> HxWx3 uint8. Used to read back previously published
-    tiles (polar.py reuses them when a fresh fill fails), so it only needs to read what write_dds writes."""
-    h, w = struct.unpack_from("<2I", dds, 12)                    # dwHeight, dwWidth in the header
-    b = np.frombuffer(dds[128:128 + w * h // 2], dtype=np.uint8).reshape(-1, 8)
-    c0 = b[:, 0].astype(np.uint32) | (b[:, 1].astype(np.uint32) << 8)
-    c1 = b[:, 2].astype(np.uint32) | (b[:, 3].astype(np.uint32) << 8)
-    p0 = np.stack(_565_to_rgb888(c0), -1).astype(np.int32)
-    p1 = np.stack(_565_to_rgb888(c1), -1).astype(np.int32)
-    four = (c0 > c1)[:, None]
-    p2 = np.where(four, (2 * p0 + p1) // 3, (p0 + p1) // 2)
-    p3 = np.where(four, (p0 + 2 * p1) // 3, 0)
-    pal = np.stack([p0, p1, p2, p3], 1)
-    bits = (b[:, 4].astype(np.uint32) | (b[:, 5].astype(np.uint32) << 8)
-            | (b[:, 6].astype(np.uint32) << 16) | (b[:, 7].astype(np.uint32) << 24))
-    idx = (bits[:, None] >> (2 * np.arange(16))[None, :]) & 3
-    px = np.take_along_axis(pal, idx[:, :, None], 1).reshape(-1, 4, 4, 3)
-    return px.reshape(h // 4, w // 4, 4, 4, 3).transpose(0, 2, 1, 3, 4).reshape(h, w, 3).astype(np.uint8)

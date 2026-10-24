@@ -5,28 +5,25 @@ Earth dark anyway (it is the night side), so the fill only has to look like clou
 Earlier versions fetched thermal infrared and tuned fills and quality limits on a few weeks of data; each new
 season or data outage broke a rule. This version has nothing to tune day to day and nothing to fetch:
 
-  1. Measure the hole in that day's data (solid no-data blob + the dark half-lit fringe around it).
+  1. Measure the hole in that day's data (solid no-data blob + the dark half-lit fringe + the dim terminator band).
   2. Fill it: the surrounding clouds' brightness spread inward (distance-weighted, nearest edge first), plus the
      fine texture of a FIXED real-cloud photo (pipeline/assets/polar_texture.png) scaled to the contrast of the
      surroundings.
-  3. If that fill looks broken (mostly black / a hard edge) or raises, reuse the previously PUBLISHED polar tiles
-     for the hole, and if those aren't available fade the hole to "no cloud".
 
-Only the two polar faces are ever touched, and any error here leaves the other four faces exactly as they were:
-apply_polar_fixes never raises.
+Only the two polar faces are ever touched, and any error here leaves the face exactly as it was:
+apply_polar_fixes never raises, so the other four faces are always published untouched.
+(Fallbacks that reused yesterday's published tiles or faded the hole to empty were tried and looked worse than
+the fill itself, so they were removed.)
 """
 from __future__ import annotations
 
 from pathlib import Path
 
 import numpy as np
-import requests
 from PIL import Image
 from scipy.ndimage import (binary_closing, binary_dilation, distance_transform_edt, gaussian_filter, label, zoom)
 
 from cubemap import equirect_to_face
-from dxt1 import decode_dds_tile
-from merge import fade_to_hole
 
 FACE_SIZE = 1024
 REF_WIDTH = 4096              # map width the pixel-sized constants below were tuned at (they scale with the width)
@@ -43,10 +40,6 @@ SPREAD_DOWN = 4               # _spread_inward works at 1/4 resolution
 TEXTURE_SCALE = 30            # px: detail finer than this comes from the fixed texture
 TEXTURE_WEIGHT = 1.0
 
-# --- "does the fill look broken?" -- deliberately loose, it only has to catch a dead fill
-DARK_LEVEL = 30               # cloud-mask value below which a pixel counts as black
-MAX_DARK_FRAC = 0.5           # more than this share of the hole near-black = dead
-MAX_EDGE_STEP = 90.0          # mean brightness just inside vs just outside the hole's edge
 
 
 def _blur(a, s):
@@ -179,105 +172,16 @@ def fill_hole(photo_face: np.ndarray, hole_face: np.ndarray, face_name: str) -> 
     return np.clip(A * (1 - w) + base * w, 0, 255).astype(np.uint8)
 
 
-def fill_looks_ok(face: np.ndarray, hole_face: np.ndarray):
-    """(ok, reason). Loose on purpose: it only has to catch a dead fill, so it can't wrongly reject a good one
-    (an earlier tight 'darkest pixels' limit did exactly that and sent Google's blocky tile out for three days)."""
-    r = _hole_radius(hole_face)
-    if r < 8:
-        return True, "tiny hole"
-    R = _radius_grid()
-    f = face.astype(np.float32)
-    if not np.isfinite(f).all():
-        return False, "non-finite pixels"
-    dark_frac = float((f[R < 0.9 * r] < DARK_LEVEL).mean())
-    if dark_frac > MAX_DARK_FRAC:
-        return False, f"{100 * dark_frac:.0f}% of the hole is near-black"
-    step = float(f[(R > r - 12) & (R < r - 2)].mean() - f[(R > r + 2) & (R < r + 12)].mean())
-    if abs(step) > MAX_EDGE_STEP:
-        return False, f"edge step {step:+.0f}"
-    return True, "ok"
-
-
-# ------------------------------------------------------------------ last published fallback
-
-def fetch_previous_faces(base_url: str, log=print, get=requests.get, timeout: float = 15.0) -> dict:
-    """The polar faces (pz, nz) of the version currently published at base_url (its root.json points at the
-    tiles; this runs before this run replaces them), decoded from the DDS tiles. {} if unreachable -- local runs
-    point at localhost, so this simply returns {} there."""
-    try:
-        root = get(f"{base_url.rstrip('/')}/root.json", timeout=timeout)
-        root.raise_for_status()
-        tiles = root.json()["baseUrl"]
-        out = {}
-        for name, idx in (("pz", 4), ("nz", 5)):
-            face = np.zeros((FACE_SIZE, FACE_SIZE), np.uint8)
-            for c in range(4):
-                for r in range(4):
-                    resp = get(f"{tiles}{idx}_2_{c}_{r}.dds", timeout=timeout)
-                    resp.raise_for_status()
-                    face[r * 256:(r + 1) * 256, c * 256:(c + 1) * 256] = decode_dds_tile(resp.content)[..., 0]
-            out[name] = face
-        return out
-    except Exception as exc:                                      # network, JSON, decode: all mean "not available"
-        log(f"previous published polar tiles unavailable: {exc}")
-        return {}
-
-
-def _reuse_previous(photo_face: np.ndarray, hole_face: np.ndarray, previous: np.ndarray) -> np.ndarray:
-    w = np.clip(2 * _blur(hole_face, max(12.0, 0.05 * _hole_radius(hole_face))), 0, 1)
-    return np.clip(photo_face * (1 - w) + previous.astype(np.float32) * w, 0, 255).astype(np.uint8)
-
-
 # ------------------------------------------------------------------ driver
 
 def _gray3(a2d: np.ndarray) -> np.ndarray:
     return np.stack([a2d] * 3, axis=-1)
 
 
-def _fix_pole(kind: str, face: str, hole_eq: np.ndarray, plain: np.ndarray, get_previous, log, fade_radius: int):
-    """Returns (uint8 face or None, report). None means leave the plain face (every step failed)."""
-    rep = {"hole": True}
-    A = plain[..., 0].astype(np.float32)
-    Hm = grow_face_hole(_face(hole_eq.astype(np.float32) * 255, face) / 255.0, A)
-    rep["radius"] = round(_hole_radius(Hm), 1)
-    # 1. the fixed-texture fill
-    try:
-        cand = fill_hole(A, Hm, face)
-        ok, reason = fill_looks_ok(cand, Hm)
-        log(f"{kind}: texture fill: {reason}")
-        if ok:
-            rep["method"] = "fixed texture fill"
-            return cand, rep
-        rep["rejected"] = reason
-    except Exception as exc:
-        log(f"{kind}: texture fill raised {exc!r}")
-        rep["error"] = repr(exc)
-    # 2. the previously published polar tiles
-    try:
-        prev = (get_previous() if get_previous else {}).get(face)
-        if prev is not None:
-            cand = _reuse_previous(A, Hm, prev)
-            ok, reason = fill_looks_ok(cand, Hm)
-            log(f"{kind}: last published tiles: {reason}")
-            if ok:
-                rep["method"] = "last published"
-                return cand, rep
-    except Exception as exc:
-        log(f"{kind}: last published fallback raised {exc!r}")
-    # 3. fade the hole to "no cloud"
-    try:
-        rep["method"] = "fade to empty"
-        return fade_to_hole(plain, Hm, fade_radius)[..., 0], rep
-    except Exception as exc:
-        log(f"{kind}: fade raised {exc!r}")
-    rep["method"] = "plain (error)"
-    return None, rep
-
-
-def apply_polar_fixes(faces: dict, cloud_gray: np.ndarray, log=print, get_previous=None, fade_radius: int = 40):
+def apply_polar_fixes(faces: dict, cloud_gray: np.ndarray, log=print):
     """Returns (faces, report). `faces` maps name -> HxWx3 uint8 cube faces built from cloud_gray; only pz and nz
-    can change. Never raises: whatever goes wrong at a pole, the other four faces are returned exactly as given.
-    get_previous: optional callable returning {"pz": 2-D uint8, "nz": ...}, only called if a fill fails."""
+    can change. Never raises: whatever goes wrong at a pole, that face (and the other four) come back exactly as
+    given."""
     faces = dict(faces)
     report = {}
     for kind, face, measure in (("arctic", "pz", north_hole), ("antarctic", "nz", south_hole)):
@@ -286,12 +190,12 @@ def apply_polar_fixes(faces: dict, cloud_gray: np.ndarray, log=print, get_previo
             hole = measure(cloud_gray)
             if not hole.any():
                 continue
-            out, rep2 = _fix_pole(kind, face, hole, faces[face], get_previous, log, fade_radius)
-            report[kind] = rep2
-            if out is not None:
-                faces[face] = _gray3(out)
-            log(f"{kind}: {rep2['method']}")
-        except Exception as exc:                                  # last line of defence: leave this pole plain
+            A = faces[face][..., 0].astype(np.float32)
+            Hm = grow_face_hole(_face(hole.astype(np.float32) * 255, face) / 255.0, A)
+            faces[face] = _gray3(fill_hole(A, Hm, face))
+            rep.update(hole=True, method="fixed texture fill", radius=round(_hole_radius(Hm), 1))
+            log(f"{kind}: fixed texture fill (hole radius {rep['radius']} px)")
+        except Exception as exc:                                  # leave this pole plain, carry on
             log(f"{kind}: polar fix failed, leaving the plain face: {exc!r}")
             report[kind] = {"hole": True, "method": "plain (error)", "error": repr(exc)}
     return faces, report

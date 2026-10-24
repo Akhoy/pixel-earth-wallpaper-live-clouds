@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from gibs import fetch_global_truecolor
 from merge import (darkest_of_n_composite, median_of_masks, fill_from_cache, inpaint_remaining_gaps, validity_mask,
                    find_polar_hole, soften_dateline)
-from polar import apply_polar_fixes, fetch_previous_faces
+from polar import apply_polar_fixes
 from cloud_mask import rgb_to_cloud_mask
 from cubemap import equirect_to_cubemap, FACE_ORDER
 from dxt1 import encode_tile_to_dds
@@ -83,14 +83,13 @@ def _fetch_and_composite(day, width: int):
     return cloud_gray, still_gap, coverage, debug_rgb
 
 
-def apply_polar_safely(faces, cloud_gray, base_url, fade_radius, report):
+def apply_polar_safely(faces, cloud_gray, report):
     """Fill the polar holes without any possibility of stopping the update or touching the other four faces.
 
     The poles are invented data (no photo there). apply_polar_fixes already never raises; this keeps the plain
     faces even if it somehow did. Fills `report` (written to _debug_polar_report.json) in place."""
     try:
-        fixed, rep = apply_polar_fixes(faces, cloud_gray, log=log, fade_radius=fade_radius,
-                                       get_previous=lambda: fetch_previous_faces(base_url, log=log))
+        fixed, rep = apply_polar_fixes(faces, cloud_gray, log=log)
         report.update(rep)
         return fixed
     except Exception as exc:
@@ -129,7 +128,7 @@ def _write_tileset(equirect_rgb: np.ndarray, dest_dir: Path, polar_fix=None) -> 
 
 def build(width: int, out_dir: Path, target_day=None, cache_dir: Path = CACHE_DIR, use_cache_fallback: bool = True,
           base_url_prefix: str = "http://localhost:8765", keep_versions: int = 5,
-          min_coverage: float = MIN_DAY_COVERAGE, polar_fade: int = 40, polar: bool = True):
+          min_coverage: float = MIN_DAY_COVERAGE, polar: bool = True):
     """out_dir is a STABLE directory: it holds root.json (always at the same
     URL) plus a versions/ subfolder. Each run publishes tiles into a NEW
     versions/<timestamp>/ folder and points root.json's baseUrl at it -- so
@@ -240,7 +239,7 @@ def build(width: int, out_dir: Path, target_day=None, cache_dir: Path = CACHE_DI
     polar_report = {}
 
     def polar_fix(faces):
-        return faces if not polar else apply_polar_safely(faces, cloud_gray, base_url_prefix, polar_fade, polar_report)
+        return faces if not polar else apply_polar_safely(faces, cloud_gray, polar_report)
 
     tile_count = _write_tileset(cloud_rgb, version_dir, polar_fix)
     (version_dir / "_debug_polar_report.json").write_text(json.dumps(polar_report, indent=2))
@@ -274,14 +273,11 @@ if __name__ == "__main__":
     ap.add_argument("--min-coverage", type=float, default=MIN_DAY_COVERAGE,
                      help="fall back a day if the chosen day is covered less than this "
                           "(0-1; a complete day is ~0.87). 0 disables the check.")
-    ap.add_argument("--polar-fade", type=int, default=40,
-                     help="last-resort fallback: blur radius (px on a 1024 face) of the cloud fade-out around a polar "
-                          "no-data hole when its fill is broken and no previously published tiles are available")
     ap.add_argument("--no-polar", action="store_true",
                      help="skip the polar fills entirely (the other four faces are never affected either way)")
     args = ap.parse_args()
     target = date.fromisoformat(args.date) if args.date else None
     build(args.width, Path(args.out), target_day=target, cache_dir=Path(args.cache_dir),
           use_cache_fallback=not args.no_cache_fallback, base_url_prefix=args.base_url,
-          keep_versions=args.keep_versions, min_coverage=args.min_coverage, polar_fade=args.polar_fade,
+          keep_versions=args.keep_versions, min_coverage=args.min_coverage,
           polar=not args.no_polar)
