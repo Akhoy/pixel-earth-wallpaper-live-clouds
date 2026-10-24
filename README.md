@@ -85,16 +85,21 @@ its assets remain with Google.
 
 ## Polar holes and the date line
 
-VIIRS true-color needs daylight, so each pole is blank for part of the year, and the daily mosaic's two
-edges (the date line) were photographed ~24h apart. `pipeline/polar.py` fills each pole on its cube face
--- Arctic from thermal infrared (VIIRS M15) when it exists, otherwise by spreading the surrounding clouds
-plus texture from Google's stock tile (`pipeline/assets/`); Antarctica the second way -- and checks the
-result, falling back to safer fills (last resort: the hole fades to "no cloud"). `merge.soften_dateline`
-cross-fades the date-line seam. Each run writes `_debug_polar_report.json` saying which fill ran. The
-Arctic infrared fill is cosmetic (infrared reads cold ice as cloud). Tests: `python -m unittest discover -s tests`.
-In deep winter the holes are 2-3x bigger and ringed by a dim terminator band; `polar.py` grows over that band,
-uses the infrared for whichever pole is on the dark side, and judges big holes by their edge. Needs `scipy`
-(in requirements.txt).
+VIIRS true-color needs daylight, so each pole is blank for part of the year (the app draws that side of the
+Earth dark anyway), and the daily mosaic's two edges (the date line) were photographed ~24h apart.
+
+`pipeline/polar.py` measures each pole's hole from that day's data and fills it with the surrounding clouds'
+brightness plus the fine texture of a **fixed** real-cloud photo (`pipeline/assets/polar_texture.png`, baked by
+`scripts/make_polar_texture.py`). Nothing is fetched and nothing needs tuning from day to day. If a fill looks
+broken or raises, the previously *published* polar tiles are reused (read back through the site's `root.json`),
+and failing that the hole fades to "no cloud". The polar step only ever changes the two polar faces and can never
+stop an update: the other four faces are always published exactly as built. `merge.soften_dateline` cross-fades
+the date-line seam. Each run writes `_debug_polar_report.json` saying which method ran; `--no-polar` skips it.
+
+(An earlier version filled the Arctic from thermal infrared with tuned quality limits; each new season or data
+outage broke a rule, so it was replaced by the fixed-texture design above.)
+
+Tests: `python -m unittest discover -s tests`. Needs `scipy` (in requirements.txt).
 
 ## Repo layout
 
