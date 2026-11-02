@@ -13,11 +13,9 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
-from gibs import fetch_global_truecolor
-from merge import (darkest_of_n_composite, median_of_masks, fill_from_cache, inpaint_remaining_gaps, validity_mask,
-                   find_polar_hole, soften_dateline)
+from eumetsat_ir import fetch_cloud_mask
+from merge import fill_from_cache, inpaint_remaining_gaps, find_polar_hole, soften_dateline
 from polar import apply_polar_fixes, fetch_previous_faces
-from cloud_mask import rgb_to_cloud_mask
 from cubemap import equirect_to_cubemap, FACE_ORDER
 from dxt1 import encode_tile_to_dds
 
@@ -34,52 +32,37 @@ def log(msg):
     print(f"[pipeline] {msg}", flush=True)
 
 
-# A fully-processed UTC day composites to roughly 87% coverage -- the missing
-# share is inherent (slivers between adjacent orbit tracks, and polar night
-# where there is no daylight to image). A day that is still being processed
-# scores far below that, so this floor separates the two without tripping on
-# the seasonal swing in how much polar night there is.
-#
-# It also covers the awkward case of running just after midnight UTC, where
-# "yesterday" has technically ended but its final orbits are still inside the
-# ~3.5h publishing delay. Coverage accrues at roughly 3.6%/hour, so such a day
-# lands near 87 - 3.5*3.6 = ~75% -- below this floor, so it gets rejected in
-# favour of the day before.
+# Dead since the switch to live EUMETSAT sourcing (see eumetsat_ir.py):
+# the service always serves its latest 3-hourly mosaic, not a specific UTC
+# day's data, so build()'s day-fallback branch below never has a different
+# day to actually retry -- coverage only ever reflects the fixed polar gap
+# (~2-3% of the globe, see eumetsat_ir.POLE_LIMIT_DEG), never low enough to
+# trip this floor. Kept (rather than removed) so that branch stays harmless
+# dead code instead of a dangling reference, in case per-day VIIRS fetching
+# is ever reinstated.
 MIN_DAY_COVERAGE = 0.78
 
 
 def _fetch_and_composite(day, width: int):
-    """Fetch the day's three VIIRS mosaics and combine them into one cloud
-    mask.
+    """Fetch the global IR cloud mosaic directly from EUMETSAT
+    (`eumetsat_ir.fetch_cloud_mask`) and derive our own cloud-density mask
+    from it -- see that module's docstring for why (matteason/live-cloud-
+    maps, built from the same underlying EUMETSAT data, badly over-
+    classifies clear land as cloud; deriving our own mask from the raw
+    product sidesteps that). `day` is accepted for signature compatibility
+    with `build()`'s day-fallback plumbing below, but is unused: the
+    service only ever serves its latest 3-hourly mosaic.
 
-    The mask is derived from each satellite pass INDEPENDENTLY first
-    (`rgb_to_cloud_mask` per source), then combined with a per-pixel median
-    (`median_of_masks`) -- not by compositing the raw photos first. See
-    `median_of_masks`'s docstring in merge.py: combining photos first
-    (darkest-of-3) discards real, fast-evolving convective cloud whenever
-    only one of the three ~30-100min-apart passes caught it, which
-    median-of-masks does not.
-
-    Also builds a darkest-of-3 RGB purely for the debug preview PNG (human
-    sanity-check of what the raw composite looked like) -- it plays no part
-    in deriving the published mask.
-
-    Returns (cloud_gray, still_gap_mask, coverage, debug_rgb) where coverage
-    is the fraction of the globe that ended up with real pixels.
+    Returns (cloud_gray, still_gap_mask, coverage, debug_rgb) matching the
+    old VIIRS-compositing signature. still_gap now reflects the real (if
+    small and fixed) polar gap, so the existing gap-fill/polar-fill
+    machinery below does real work again, same as it did for VIIRS.
     """
-    sources = []
-    for sat in ["noaa21", "noaa20", "snpp"]:
-        log(f"fetching {sat} VIIRS true-color mosaic for {day} at width={width} ...")
-        sources.append(fetch_global_truecolor(sat, day.isoformat(), width=width))
-
-    log("deriving cloud mask per-satellite, combining via per-pixel median ...")
-    masks = [rgb_to_cloud_mask(s) for s in sources]
-    valids = [validity_mask(s) for s in sources]
-    cloud_gray, still_gap = median_of_masks(masks, valids)
+    log(f"fetching EUMETSAT IR cloud mosaic (ignoring day={day}; always serves its latest 3-hourly scan) ...")
+    cloud_gray, still_gap = fetch_cloud_mask(width)
     coverage = 1.0 - float(still_gap.mean())
-    log(f"{day}: {100*coverage:.1f}% covered ({100*(1-coverage):.1f}% gaps)")
-
-    debug_rgb, _ = darkest_of_n_composite(sources)
+    log(f"{100*coverage:.1f}% covered ({100*(1-coverage):.1f}% polar gap)")
+    debug_rgb = np.stack([cloud_gray] * 3, axis=-1)
     return cloud_gray, still_gap, coverage, debug_rgb
 
 
