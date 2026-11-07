@@ -1,54 +1,61 @@
 # pixel-earth-wallpaper-live-clouds
 
-A data pipeline that fetches real satellite cloud imagery daily and publishes
-it as a cloud-density mask, in the exact cube-face tile format that Google's
-"Marvelous Marble" Earth live wallpaper (`com.breel.wallpapers18`, a Pixel
-wallpaper) expects. The app's own two live-data endpoints (cloud tiles and
-lightning-storm locations) both stopped updating years ago; this project
-replaces the cloud-tile side with real, current data.
+This project fixes Google's "Marvelous Marble" Earth live wallpaper
+(`com.breel.wallpapers18`, a Pixel wallpaper). The app shows a spinning Earth
+with real-looking clouds and lightning storms, but Google's own servers for
+that data stopped updating years ago — so the "live" wallpaper has been
+showing the same frozen cloud pattern since then. This project replaces the
+cloud data with something that's actually current, refreshed automatically
+every few hours.
 
-**This repo contains the pipeline only — no Google code or assets are in the
-source tree.** The app side is a patched build of Google's original wallpaper
-APK (its `CloudsProvider` repointed at the URL this pipeline publishes to). That
-patched APK is **not** part of the source; it is attached as a binary on the
-[Releases page](../../releases) — see [Download the patched app](#download-the-patched-app).
+**This repo contains only the data pipeline** — the code that fetches
+satellite photos and turns them into cloud images the app can use. No Google
+code or app assets live here. The app itself is a small patch to Google's
+original APK (just pointing it at this project's data instead of Google's
+dead server); that patched APK is **not** part of this source, it's attached
+as a download on the [Releases page](../../releases) — see
+[Download the patched app](#download-the-patched-app).
 
-## How it works
+## How it works, in plain terms
 
-Once a day, [GitHub Actions](.github/workflows/pipeline.yml) runs
-[`pipeline/run_pipeline.py`](pipeline/run_pipeline.py), which:
+Several times a day, [GitHub Actions](.github/workflows/pipeline.yml)
+automatically runs [`pipeline/run_pipeline.py`](pipeline/run_pipeline.py),
+which does this:
 
-1. **Fetches** the latest full-Earth true-color mosaic from three
-   independent polar-orbiting satellites — NOAA-20, NOAA-21, and Suomi
-   NPP (VIIRS instrument), via NASA's public GIBS API (`pipeline/gibs.py`).
-   Three sources are used because any single satellite's daily mosaic has
-   real defects: granule-to-granule stitching seams, transient haze/smoke,
-   and sun-glint.
-2. **Derives a grayscale cloud-density mask from each satellite
-   independently** (`pipeline/cloud_mask.py`) — clouds are bright *and*
-   low-saturation (white/gray), while land and ocean are comparatively
-   colorful, so `brightness × (1 − saturation)` (with a tuned gamma curve)
-   gives a per-pixel "how cloud-like is this" score.
-3. **Combines the three masks via a per-pixel median**
-   (`pipeline/merge.py`). This is deliberately done *after* deriving each
-   mask, not before combining the raw photos — combining photos first
-   (e.g. always picking the darkest/clearest reading) also discards real,
-   fast-evolving convective cloud whenever only one of the three
-   ~30–100-minute-apart passes caught it. Taking the median of independently
-   derived masks keeps that cloud while still rejecting genuine
-   single-satellite outliers (glint, a stitching seam).
-4. **Fills any remaining gaps** (missing swaths, polar night) from the
-   previous run's cache, then inpaints anything still missing, and cleans
-   up the Antarctic coverage edge specifically (`fix_antarctic_cap`).
-5. **Reprojects** the equirectangular mask onto 6 cube faces in the same
-   sampling convention the app's shader uses (`pipeline/cubemap.py`), and
-   **encodes** each face into 256×256 DXT1/DDS tiles with a hand-written
-   encoder verified byte-for-byte against the app's original tile format
+1. **Downloads two photos of the whole Earth** from EUMETSAT, a European
+   weather-satellite agency that gives this data away for free. One photo is
+   ordinary infrared — it doesn't see light, it sees *heat* (cold cloud-tops
+   glow bright, warm ground stays dark), so it works day or night
+   (`pipeline/eumetsat_ir.py`).
+2. **Turns that photo into a "how cloudy is it here" map.** Colder spots in
+   the infrared photo are scored as more likely to be cloud. Instead of
+   judging every spot on Earth against one fixed brightness cutoff, each
+   pixel is compared against the *coldest that exact spot has ever read* —
+   its own personal "clear sky" baseline — so a wisp of cloud over a place
+   that's naturally cold (like a mountain) still stands out, without
+   mistaking the mountain itself for cloud the way a single global cutoff
+   would.
+3. **Fills in small gaps.** The satellite can't quite see all the way to
+   either pole, so that sliver gets patched with a real cloud photo's
+   texture (`pipeline/polar.py`) rather than being left blank, and the
+   seam where the map wraps around (the international date line) is
+   smoothed so it doesn't show as a hard line.
+4. **Reshapes the flat map onto a cube** — six square faces, the way the
+   wallpaper's 3D globe actually expects its texture (`pipeline/cubemap.py`)
+   — and **compresses** each face into the exact tiny image format the app
+   reads, matched byte-for-byte to what Google's own app originally used
    (`pipeline/dxt1.py`).
-6. **Publishes** the tiles plus a `root.json` pointer file. `root.json`
-   lives at a stable URL; its `baseUrl` field points at a fresh
-   `versions/<timestamp>/` folder each run, so the app's own "has the
-   baseUrl changed?" check correctly notices new data is available.
+5. **Publishes** the result to a public web address. The app checks that
+   address periodically and swaps in the new clouds automatically — no
+   update to the app itself is ever needed, only new data.
+
+There's also a newer, experimental version of step 1-2
+(`pipeline/eumetsat_visible_ir.py`) that additionally looks at an ordinary
+daylight photo, not just infrared, so clouds the heat-camera alone might
+miss (low, thin, or the same temperature as the ground) still show up where
+there's daylight. It was built and tested carefully in a separate project
+and is included here for reference, but **isn't turned on yet** — the live
+pipeline above still runs on infrared alone.
 
 GitHub Pages then serves the published output directly from the repo's
 `gh-pages` branch — live at:
@@ -85,28 +92,35 @@ its assets remain with Google.
 
 ## Polar holes and the date line
 
-VIIRS true-color needs daylight, so each pole is blank for part of the year (the app draws that side of the
-Earth dark anyway), and the daily mosaic's two edges (the date line) were photographed ~24h apart.
+The satellite mosaic can't quite see past about 81° latitude at either pole — a small, fixed sliver, not a
+seasonal thing — and the flat map's left/right edges (the international date line) can show a visible seam.
 
-`pipeline/polar.py` measures each pole's hole from that day's data and fills it with the surrounding clouds'
-brightness plus the fine texture of a **fixed** real-cloud photo (`pipeline/assets/polar_texture.png`, baked by
+`pipeline/polar.py` fills each pole's hole with the surrounding clouds' brightness plus the fine texture of a
+**fixed** real-cloud photo (`pipeline/assets/polar_texture.png`, baked ahead of time by
 `scripts/make_polar_texture.py`). Nothing is fetched and nothing needs tuning from day to day. The polar step only
-ever changes the two polar faces and can never stop an update. If the fill itself crashes for a pole, that pole
+ever changes the two polar faces and can never stop an update: if the fill itself crashes for a pole, that pole
 reuses the previously published polar tiles (read from the site before the new version replaces them), and only if
-those are unavailable too is it published as built (the other four faces always are). `merge.soften_dateline` cross-fades the date-line seam. Each run writes
-`_debug_polar_report.json` saying what ran; `--no-polar` skips it.
-
-(An earlier version filled the Arctic from thermal infrared with tuned quality limits; each new season or data
-outage broke a rule, so it was replaced by the fixed-texture design above.)
+those are unavailable too is it published as plain (the other four faces are always published untouched either
+way). `pipeline/merge.py`'s `soften_dateline` cross-fades the date-line seam. Each run writes
+`_debug_polar_report.json` describing what happened; `--no-polar` skips the polar step entirely.
 
 Tests: `python -m unittest discover -s tests`. Needs `scipy` (in requirements.txt).
 
 ## Repo layout
 
-- `pipeline/run_pipeline.py` — the daily cloud-mask job (entry point run by CI)
-- `pipeline/gibs.py` — fetches VIIRS true-color mosaics from NASA GIBS
-- `pipeline/cloud_mask.py` — per-satellite cloud-density derivation
-- `pipeline/merge.py` — median-of-masks combining, cache gap-fill, inpainting
+- `pipeline/run_pipeline.py` — the scheduled cloud-mask job (entry point run by CI)
+- `pipeline/eumetsat_ir.py` — the module actually in use: derives a cloud
+  map from EUMETSAT's infrared satellite photo
+- `pipeline/eumetsat_multisignal.py` — a richer version of the above (adds a
+  second EUMETSAT product plus a terrain-elevation correction); built and
+  working, not yet switched on in `run_pipeline.py`
+- `pipeline/eumetsat_visible_ir.py` — a further alternative that also uses
+  ordinary daylight photos, not just infrared (see "How it works" above);
+  also not yet switched on
+- `pipeline/polar.py` — fills the small pole gaps with a fixed real-cloud
+  texture (see above)
+- `pipeline/merge.py` — gap-filling from cache, inpainting, and the
+  date-line seam fade
 - `pipeline/cubemap.py` — equirectangular → 6-cube-face reprojection
 - `pipeline/dxt1.py` — hand-written DXT1/DDS tile encoder
 - `pipeline/serve.py` — small local dev server (rewrites `root.json`'s
@@ -123,9 +137,8 @@ Tests: `python -m unittest discover -s tests`. Needs `scipy` (in requirements.tx
   currently **deprioritized** pipeline for replacing the app's frozen
   lightning-storm feed (GOES GLM + EUMETSAT + Xweather spot-checks). Not
   part of the scheduled GitHub Actions job yet.
-- `realtime_geo/` — an earlier, abandoned experiment overlaying live INSAT/
-  GOES/EUMETSAT geostationary imagery instead of polar-orbiting VIIRS (kept
-  for reference; see `realtime_geo/README.md`)
+- `realtime_geo/` — an earlier, abandoned experiment overlaying live
+  geostationary imagery (kept for reference; see `realtime_geo/README.md`)
 
 ## Running locally
 
@@ -148,6 +161,12 @@ python3 pipeline/serve.py --port 8765 --dir output/latest
 - **Cache continuity in CI**: each GitHub Actions run starts from a clean
   checkout, so the "fill gaps from yesterday's cache" step has nothing to
   fall back on between scheduled runs (falls straight through to
-  inpainting instead). Works fine in practice — VIIRS coverage is normally
-  well above the pipeline's minimum-coverage floor — but isn't as robust as
-  a long-running server with a persistent cache would be.
+  inpainting instead). Works fine in practice — EUMETSAT's own coverage gap
+  is small and fixed (just the polar slivers `polar.py` already handles) —
+  but isn't as robust as a long-running server with a persistent cache
+  would be.
+- **Two better cloud-mask versions exist but aren't switched on yet**
+  (`eumetsat_multisignal.py` and `eumetsat_visible_ir.py`, see
+  [Repo layout](#repo-layout)) — `run_pipeline.py` still runs the simpler
+  infrared-only version. Swapping it in is a small, deliberate next step,
+  not done in this pass.
