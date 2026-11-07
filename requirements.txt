@@ -5,7 +5,7 @@ requests
 scipy       # pipeline/polar.py (polar-hole fills) and pipeline/merge.py's date-line fade
 
 # Only needed for the storms pipeline (pipeline/run_storms.py) and for local
-# debugging tools (clearsky.py, preview_globe.py) -- not installed by the
-# scheduled GitHub Actions workflow, which runs run_pipeline.py only.
+# debugging tools (preview_globe.py) -- not installed by the scheduled
+# GitHub Actions workflow, which runs run_pipeline.py only.
 # h5py
 # texture2ddecoder

@@ -129,16 +129,11 @@ Tests: `python -m unittest discover -s tests`. Needs `scipy` (in requirements.tx
 - `pipeline/preview_globe.py` — renders a candidate cloud mask through the
   same day/night/terminator/atmosphere shader math the app uses, so changes
   can be judged without a phone
-- `pipeline/clearsky.py` — an experimental multi-day clear-sky reference
-  builder (evaluated, not currently wired into the production mask — see
-  inline docstrings for why)
 - `pipeline/storms.py`, `run_storms.py`, `run_storms_pipeline.py`,
   `storm_protobuf.py`, `glm_lightning.py`, `geos_reproject.py` — a separate,
   currently **deprioritized** pipeline for replacing the app's frozen
   lightning-storm feed (GOES GLM + EUMETSAT + Xweather spot-checks). Not
   part of the scheduled GitHub Actions job yet.
-- `realtime_geo/` — an earlier, abandoned experiment overlaying live
-  geostationary imagery (kept for reference; see `realtime_geo/README.md`)
 
 ## Running locally
 

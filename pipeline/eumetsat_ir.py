@@ -88,7 +88,7 @@ def _latest_layer_time(timeout: int = 30) -> str:
     """The WMS time dimension uses nearestValue, but an arbitrary "now"
     timestamp can land between valid scans and 502 -- read the layer's
     current `default` time out of GetCapabilities first, then request
-    exactly that (same approach as realtime_geo/fetch_eumetsat.py)."""
+    exactly that."""
     resp = requests.get(WMS_URL, params={
         "service": "WMS", "version": "1.3.0", "request": "GetCapabilities",
     }, timeout=timeout)
