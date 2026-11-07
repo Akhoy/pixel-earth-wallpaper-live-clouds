@@ -1,0 +1,10 @@
+{
+  "arctic": {
+    "hole": true,
+    "method": "fixed texture fill",
+    "radius": 289.0
+  },
+  "antarctic": {
+    "hole": false
+  }
+}
